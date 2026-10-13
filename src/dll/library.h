@@ -1,7 +1,7 @@
 /**
  * @file dll/library.h
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -46,6 +46,15 @@
 #define DEBUGLOGSID(fmt, Sid)           ((void)0)
 #endif
 
+/* DEBUGTEST */
+#if !defined(NDEBUG)
+ULONG DebugRandom(VOID);
+#define DEBUGTEST(Percent)              \
+    (DebugRandom() <= (Percent) * 0x7fff / 100)
+#else
+#define DEBUGTEST(Percent)              (TRUE)
+#endif
+
 VOID FspWksidFinalize(BOOLEAN Dynamic);
 VOID FspPosixFinalize(BOOLEAN Dynamic);
 VOID FspEventLogFinalize(BOOLEAN Dynamic);
@@ -61,8 +70,20 @@ NTSTATUS FspNpUnregister(VOID);
 NTSTATUS FspEventLogRegister(VOID);
 NTSTATUS FspEventLogUnregister(VOID);
 
+PWSTR FspSxsSuffix(VOID);
+PWSTR FspSxsAppendSuffix(PWCHAR Buffer, SIZE_T Size, PWSTR Ident);
+
 PSID FspWksidNew(WELL_KNOWN_SID_TYPE WellKnownSidType, PNTSTATUS PResult);
 PSID FspWksidGet(WELL_KNOWN_SID_TYPE WellKnownSidType);
+
+NTSTATUS FspMountmgrCreateDrive(
+    PUNICODE_STRING VolumeName, GUID *UniqueId, PUNICODE_STRING MountPoint);
+NTSTATUS FspMountmgrDeleteDrive(
+    PUNICODE_STRING MountPoint);
+NTSTATUS FspMountmgrNotifyCreateDirectory(
+    PUNICODE_STRING VolumeName, GUID *UniqueId, PUNICODE_STRING MountPoint);
+NTSTATUS FspMountmgrNotifyDeleteDirectory(
+    PUNICODE_STRING VolumeName, PUNICODE_STRING MountPoint);
 
 ULONG FspLdapConnect(PWSTR HostName, PVOID *PLdap);
 VOID FspLdapClose(PVOID Ldap);
@@ -72,11 +93,39 @@ ULONG FspLdapGetDefaultNamingContext(PVOID Ldap, PWSTR *PValue);
 ULONG FspLdapGetTrustPosixOffset(PVOID Ldap, PWSTR Context, PWSTR Domain, PWSTR *PValue);
 
 PWSTR FspDiagIdent(VOID);
+HANDLE FspCreateDirectoryFileW(
+    PWSTR FileName,
+    DWORD DesiredAccess,
+    DWORD ShareAccess,
+    PSECURITY_ATTRIBUTES SecurityAttributes,
+    DWORD FlagsAndAttributes);
+NTSTATUS FspGetModuleVersion(PWSTR ModuleFileName, PUINT32 PVersion);
+NTSTATUS FspGetModuleFileName(
+    HMODULE Module,
+    PWSTR FileName,
+    ULONG Size,
+    PWSTR RelativePath);
+
+typedef struct
+{
+    SRWLOCK Lock;
+    HANDLE Handle;
+    UINT64 Offset;
+} FSP_ADAPTIVE_LOCK;
+#define FSP_ADAPTIVE_LOCK_INIT          { SRWLOCK_INIT, INVALID_HANDLE_VALUE, 0 }
+VOID FspAdaptiveLockAcquire(
+    FSP_ADAPTIVE_LOCK *Lock,
+    PWSTR FileName,
+    UINT64 Offset,
+    DWORD Timeout);
+VOID FspAdaptiveLockRelease(
+    FSP_ADAPTIVE_LOCK *Lock);
 
 #define FspFileSystemDirectoryBufferEntryInvalid ((ULONG)-1)
 VOID FspFileSystemPeekInDirectoryBuffer(PVOID *PDirBuffer,
     PUINT8 *PBuffer, PULONG *PIndex, PULONG PCount);
 
+VOID FspServiceStopLoop(VOID);
 BOOL WINAPI FspServiceConsoleCtrlHandler(DWORD CtrlType);
 
 static inline ULONG FspPathSuffixIndex(PWSTR FileName)
@@ -115,6 +164,12 @@ static inline BOOLEAN FspPathIsMountmgrMountPoint(PWSTR FileName)
             (L'a' <= FileName[4] && FileName[4] <= L'z')
         ) &&
         L':' == FileName[5];
+}
+static inline BOOLEAN FspPathIsMountmgrDrive(PWSTR FileName)
+{
+    return
+        FspPathIsMountmgrMountPoint(FileName) &&
+        L'\0' == FileName[6];
 }
 
 #define FSP_NEXT_EA(Ea, EaEnd)          \

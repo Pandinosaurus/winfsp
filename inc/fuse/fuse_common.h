@@ -6,7 +6,7 @@
  *     FUSE: Filesystem in Userspace
  *     Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -93,6 +93,9 @@ extern "C" {
 #define FSP_FUSE_NOTIFY_UTIME           0x0040
 #define FSP_FUSE_NOTIFY_CHFLAGS         0x0080
 #define FSP_FUSE_NOTIFY_TRUNCATE        0x0100
+
+/* getpath extension */
+#define FSP_FUSE_HAS_GETPATH            1
 
 struct fuse_file_info
 {

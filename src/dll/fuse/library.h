@@ -1,7 +1,7 @@
 /**
  * @file dll/fuse/library.h
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -55,6 +55,7 @@ struct fuse
     int set_create_dir_umask, create_dir_umask;
     int set_uid, uid;
     int set_gid, gid;
+    int add_write_ea_access;
     int rellinks;
     int dothidden;
     unsigned ThreadCount;
@@ -63,6 +64,7 @@ struct fuse
     unsigned conn_want;
     BOOLEAN fsinit;
     BOOLEAN has_symlinks, has_slashdot;
+    BOOLEAN FlushOnCleanup;
     UINT32 DebugLog;
     FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY OpGuardStrategy;
     FSP_FSCTL_VOLUME_PARAMS VolumeParams;
@@ -147,6 +149,8 @@ struct fsp_fuse_core_opt_data
         set_create_dir_umask, create_dir_umask,
         set_uid, uid, username_to_uid_result,
         set_gid, gid,
+        add_write_ea_access,
+        set_uidmap,
         set_attr_timeout, attr_timeout,
         rellinks,
         dothidden;
@@ -155,6 +159,7 @@ struct fsp_fuse_core_opt_data
         set_EaTimeout,
         set_VolumeInfoTimeout,
         set_KeepFileCache,
+        set_FlushOnCleanup,
         set_LegacyUnlinkRename;
     unsigned ThreadCount;
     FSP_FSCTL_VOLUME_PARAMS VolumeParams;

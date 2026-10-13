@@ -1,7 +1,7 @@
 /**
  * @file sys/write.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -21,6 +21,7 @@
 
 #include <sys/driver.h>
 
+FAST_IO_WRITE FspFastIoWrite;
 static NTSTATUS FspFsvolWrite(
     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 static NTSTATUS FspFsvolWriteCached(
@@ -36,6 +37,7 @@ static FSP_IOP_REQUEST_FINI FspFsvolWriteNonCachedRequestFini;
 FSP_DRIVER_DISPATCH FspWrite;
 
 #ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, FspFastIoWrite)
 #pragma alloc_text(PAGE, FspFsvolWrite)
 #pragma alloc_text(PAGE, FspFsvolWriteCached)
 #pragma alloc_text(PAGE, FspFsvolWriteNonCached)
@@ -55,6 +57,129 @@ enum
     RequestProcess                      = 3,
 };
 FSP_FSCTL_STATIC_ASSERT(RequestCookie == RequestSafeMdl, "");
+
+BOOLEAN FspFastIoWrite(
+    PFILE_OBJECT FileObject,
+    PLARGE_INTEGER ByteOffset,
+    ULONG Length,
+    BOOLEAN CanWait,
+    ULONG Key,
+    PVOID UserBuffer,
+    PIO_STATUS_BLOCK IoStatus,
+    PDEVICE_OBJECT DeviceObject)
+{
+    FSP_ENTER_FIO(PAGED_CODE());
+
+    IoStatus->Status = STATUS_SUCCESS;
+    IoStatus->Information = 0;
+
+    if (!FspFileNodeIsValid(FileObject->FsContext))
+    {
+        IoStatus->Status = STATUS_INVALID_DEVICE_REQUEST;
+        FSP_RETURN(Result = TRUE);
+    }
+
+    FSP_FILE_NODE* FileNode = FileObject->FsContext;
+    LARGE_INTEGER WriteOffset = *ByteOffset;
+    ULONG WriteLength = Length;
+    BOOLEAN WriteToEndOfFile =
+        FILE_WRITE_TO_END_OF_FILE == WriteOffset.LowPart && -1L == WriteOffset.HighPart;
+    FSP_FSCTL_FILE_INFO FileInfo;
+    UINT64 WriteEndOffset;
+    BOOLEAN ExtendingFile;
+
+    /* only regular files can be written */
+    if (FileNode->IsDirectory)
+    {
+        IoStatus->Status = STATUS_INVALID_PARAMETER;
+        FSP_RETURN(Result = TRUE);
+    }
+
+    /* do we have anything to write? */
+    if (0 == WriteLength)
+        FSP_RETURN(Result = TRUE);
+
+    /* WinFsp cannot do Fast I/O when extending file */
+    if (WriteToEndOfFile)
+        FSP_RETURN(Result = FALSE);
+
+    /* does the file support caching? is it write-through? */
+    if (!FlagOn(FileObject->Flags, FO_CACHE_SUPPORTED) ||
+        FlagOn(FileObject->Flags, FO_WRITE_THROUGH))
+        FSP_RETURN(Result = FALSE);
+
+    /* can we write without flushing? */
+    Result = DEBUGTEST(90) &&
+        CcCanIWrite(FileObject, WriteLength, CanWait, FALSE) &&
+        CcCopyWriteWontFlush(FileObject, &WriteOffset, WriteLength);
+    if (!Result)
+        FSP_RETURN(Result = FALSE);
+
+    /* try to acquire the FileNode Main exclusive */
+    Result = DEBUGTEST(90) &&
+        FspFileNodeTryAcquireExclusiveF(FileNode, FspFileNodeAcquireMain, CanWait);
+    if (!Result)
+        FSP_RETURN(Result = FALSE);
+
+    /* is the file actually cached? */
+    if (0 == FileObject->PrivateCacheMap)
+    {
+        FspFileNodeRelease(FileNode, Main);
+        FSP_RETURN(Result = FALSE);
+    }
+
+    /* does the file have oplocks or file locks? */
+    Result =
+        FsRtlOplockIsFastIoPossible(FspFileNodeAddrOfOplock(FileNode)) &&
+        !FsRtlAreThereCurrentFileLocks(&FileNode->FileLock);
+    if (!Result)
+    {
+        FspFileNodeRelease(FileNode, Main);
+        FSP_RETURN(Result = FALSE);
+    }
+
+    /* compute new file size */
+    ASSERT(FspTimeoutInfinity32 ==
+        FspFsvolDeviceExtension(FsvolDeviceObject)->VolumeParams.FileInfoTimeout);
+    FspFileNodeGetFileInfo(FileNode, &FileInfo);
+    if (WriteToEndOfFile)
+        WriteOffset.QuadPart = FileInfo.FileSize;
+    WriteEndOffset = WriteOffset.QuadPart + WriteLength;
+    ExtendingFile = FileInfo.FileSize < WriteEndOffset;
+
+    /* WinFsp cannot do Fast I/O when extending file */
+    if (ExtendingFile)
+    {
+        FspFileNodeRelease(FileNode, Main);
+        FSP_RETURN(Result = FALSE);
+    }
+
+    NTSTATUS Result0 =
+        FspCcCopyWrite(FileObject, &WriteOffset, WriteLength, CanWait, UserBuffer);
+    if (!NT_SUCCESS(Result0))
+    {
+        IoStatus->Status = Result0;
+        IoStatus->Information = 0;
+        FspFileNodeRelease(FileNode, Main);
+        FSP_RETURN(Result = FALSE);
+    }
+    Result = STATUS_SUCCESS == Result0;
+
+    if (Result)
+    {
+        SetFlag(FileObject->Flags, FO_FILE_MODIFIED);
+        FileObject->CurrentByteOffset.QuadPart = WriteEndOffset;
+        IoStatus->Information = WriteLength;
+    }
+
+    FspFileNodeRelease(FileNode, Main);
+
+    FSP_LEAVE_FIO(
+        "FileObject=%p, UserBuffer=%p, CanWait=%d, "
+        "Key=%#lx, ByteOffset=%#lx:%#lx, Length=%ld",
+        FileObject, UserBuffer, CanWait,
+        Key, ByteOffset->HighPart, ByteOffset->LowPart, Length);
+}
 
 static NTSTATUS FspFsvolWrite(
     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
@@ -122,23 +247,12 @@ static NTSTATUS FspFsvolWriteCached(
     FILE_END_OF_FILE_INFORMATION EndOfFileInformation;
     UINT64 WriteEndOffset;
     BOOLEAN ExtendingFile;
+    BOOLEAN DeferWrite;
     BOOLEAN Success;
 
     /* should we defer the write? */
     Success = DEBUGTEST(90) && CcCanIWrite(FileObject, WriteLength, CanWait, Retrying);
-    if (!Success)
-    {
-        Result = FspWqCreateIrpWorkItem(Irp, FspFsvolWriteCached, 0);
-        if (NT_SUCCESS(Result))
-        {
-            IoMarkIrpPending(Irp);
-            CcDeferWrite(FileObject, FspFsvolWriteCachedDeferred, Irp, 0, WriteLength, Retrying);
-
-            return STATUS_PENDING;
-        }
-
-        /* if we are unable to defer we will go ahead and (try to) service the IRP now! */
-    }
+    DeferWrite = !Success;
 
     /* try to acquire the FileNode Main exclusive */
     Success = DEBUGTEST(90) &&
@@ -194,6 +308,21 @@ static NTSTATUS FspFsvolWriteCached(
             FspFileNodeRelease(FileNode, Main);
             return Result;
         }
+    }
+
+    /* should we defer the write? */
+    if (DeferWrite)
+    {
+        Result = FspWqCreateIrpWorkItem(Irp, FspFsvolWriteCached, 0);
+        if (NT_SUCCESS(Result))
+        {
+            FspFileNodeRelease(FileNode, Main);
+            IoMarkIrpPending(Irp);
+            CcDeferWrite(FileObject, FspFsvolWriteCachedDeferred, Irp, 0, WriteLength, Retrying);
+            return STATUS_PENDING;
+        }
+
+        /* if we are unable to defer we will go ahead and (try to) service the IRP now! */
     }
 
     /* are we extending the file? */

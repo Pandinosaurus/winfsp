@@ -1,7 +1,7 @@
 /**
  * @file dll/fs.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -358,6 +358,21 @@ exit:
         CloseHandle(DispatcherThread);
     }
 
+    if (GetCurrentThreadId() == GetThreadId(FileSystem->DispatcherThread))
+    {
+        if (0 != FileSystem->Interface->DispatcherStopped)
+        {
+            /* Normally = !!FileSystem->DispatcherStopping */
+            BOOLEAN Normally = !!(
+                _InterlockedOr16(
+                    (PVOID)((PUINT8)&FileSystem->UmFileContextIsFullContext +
+                        sizeof(FileSystem->UmFileContextIsFullContext)),
+                    0) &
+                0x8000);
+            FileSystem->Interface->DispatcherStopped(FileSystem, Normally);
+        }
+    }
+
     return Result;
 }
 
@@ -391,6 +406,11 @@ FSP_API NTSTATUS FspFileSystemStartDispatcher(FSP_FILE_SYSTEM *FileSystem, ULONG
     if (0 == FileSystem->DispatcherThread)
         return FspNtStatusFromWin32(GetLastError());
 
+#if defined(FSP_CFG_REJECT_EARLY_IRP)
+    FspFsctlTransact(FileSystem->VolumeHandle, 0, 0, 0, 0, FALSE);
+        /* send a Transact0 to inform the FSD that the dispatcher is _almost_ ready */
+#endif
+
     return STATUS_SUCCESS;
 }
 
@@ -399,6 +419,12 @@ FSP_API VOID FspFileSystemStopDispatcher(FSP_FILE_SYSTEM *FileSystem)
     if (0 == FileSystem->DispatcherThread)
         return;
 
+    /* FileSystem->DispatcherStopping = 1 */
+    _InterlockedOr16(
+        (PVOID)((PUINT8)&FileSystem->UmFileContextIsFullContext +
+            sizeof(FileSystem->UmFileContextIsFullContext)),
+        0x8000);
+
     FspFsctlStop0(FileSystem->VolumeHandle);
 
     WaitForSingleObject(FileSystem->DispatcherThread, INFINITE);
@@ -406,6 +432,12 @@ FSP_API VOID FspFileSystemStopDispatcher(FSP_FILE_SYSTEM *FileSystem)
     FileSystem->DispatcherThread = 0;
 
     FspFsctlStop(FileSystem->VolumeHandle);
+
+    /* FileSystem->DispatcherStopping = 0 */
+    _InterlockedAnd16(
+        (PVOID)((PUINT8)&FileSystem->UmFileContextIsFullContext +
+            sizeof(FileSystem->UmFileContextIsFullContext)),
+        0x7fff);
 }
 
 FSP_API VOID FspFileSystemSendResponse(FSP_FILE_SYSTEM *FileSystem,

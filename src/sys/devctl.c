@@ -1,7 +1,7 @@
 /**
  * @file sys/devctl.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -21,6 +21,9 @@
 
 #include <sys/driver.h>
 
+FAST_IO_DEVICE_CONTROL FspFastIoDeviceControl;
+static NTSTATUS FspFsctlDeviceControl(
+    PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 static NTSTATUS FspFsvrtDeviceControl(
     PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 static BOOLEAN FspFsvrtDeviceControlStorageQuery(
@@ -33,6 +36,8 @@ static FSP_IOP_REQUEST_FINI FspFsvolDeviceControlRequestFini;
 FSP_DRIVER_DISPATCH FspDeviceControl;
 
 #ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, FspFastIoDeviceControl)
+#pragma alloc_text(PAGE, FspFsctlDeviceControl)
 #pragma alloc_text(PAGE, FspFsvrtDeviceControl)
 #pragma alloc_text(PAGE, FspFsvrtDeviceControlStorageQuery)
 #pragma alloc_text(PAGE, FspFsvolDeviceControl)
@@ -45,6 +50,110 @@ enum
 {
     RequestFileNode                     = 0,
 };
+
+BOOLEAN FspFastIoDeviceControl(
+    PFILE_OBJECT FileObject,
+    BOOLEAN CanWait,
+    PVOID InputBuffer,
+    ULONG InputBufferLength,
+    PVOID OutputBuffer,
+    ULONG OutputBufferLength,
+    ULONG IoControlCode,
+    PIO_STATUS_BLOCK IoStatus,
+    PDEVICE_OBJECT DeviceObject)
+{
+    FSP_ENTER_BOOL(PAGED_CODE());
+        /* cannot use FSP_ENTER_FIO() because it only supports fsvol devices */
+
+    Result = DEBUGTEST(50) &&
+        CanWait &&
+        FSP_IOCTL_TRANSACT == IoControlCode &&
+        FspFsctlDeviceExtensionKind == FspDeviceExtension(DeviceObject)->Kind &&
+        0 != FileObject->FsContext2;
+    if (!Result)
+        FSP_RETURN();
+
+    if (0 != InputBufferLength &&
+        FSP_FSCTL_DEFAULT_ALIGN_UP(sizeof(FSP_FSCTL_TRANSACT_RSP)) > InputBufferLength)
+        FSP_RETURN(IoStatus->Status = STATUS_INVALID_PARAMETER);
+    if (0 != OutputBufferLength &&
+        FSP_FSCTL_TRANSACT_BUFFER_SIZEMIN > OutputBufferLength)
+        FSP_RETURN(IoStatus->Status = STATUS_BUFFER_TOO_SMALL);
+
+    PVOID SystemBuffer = 0;
+
+    if (0 != InputBufferLength || 0 != OutputBufferLength)
+    {
+        SystemBuffer = FspAllocNonPaged(
+            InputBufferLength > OutputBufferLength ? InputBufferLength : OutputBufferLength);
+        if (0 == SystemBuffer)
+            FSP_RETURN(Result = FALSE);
+        if (0 != InputBuffer)
+            try
+            {
+                RtlCopyMemory(SystemBuffer, InputBuffer, InputBufferLength);
+            }
+            except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                FspFree(SystemBuffer);
+                FSP_RETURN(Result = FALSE);
+            }
+    }
+
+    ASSERT(0 == IoGetTopLevelIrp());
+    IoSetTopLevelIrp((PIRP)FSRTL_FAST_IO_TOP_LEVEL_IRP);
+
+    IoStatus->Status = FspVolumeFastTransact(
+        FileObject->FsContext2,
+        IoControlCode,
+        SystemBuffer,
+        InputBufferLength,
+        0 != OutputBufferLength ? SystemBuffer : 0,
+        OutputBufferLength,
+        IoStatus,
+        (PIRP)FSRTL_FAST_IO_TOP_LEVEL_IRP);
+
+    IoSetTopLevelIrp(0);
+
+    if (0 != SystemBuffer)
+    {
+        if (NT_SUCCESS(IoStatus->Status) && 0 != OutputBuffer)
+            try
+            {
+                RtlCopyMemory(OutputBuffer, SystemBuffer, IoStatus->Information);
+            }
+            except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                IoStatus->Status = GetExceptionCode();
+                IoStatus->Information = 0;
+            }
+        FspFree(SystemBuffer);
+    }
+
+    FSP_LEAVE_BOOL(
+        "%s, FileObject=%p",
+        IoctlCodeSym(IoControlCode),
+        FileObject);
+}
+
+static NTSTATUS FspFsctlDeviceControl(
+    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
+{
+    PAGED_CODE();
+
+    NTSTATUS Result = STATUS_INVALID_DEVICE_REQUEST;
+    switch (IrpSp->Parameters.DeviceIoControl.IoControlCode)
+    {
+    case FSP_IOCTL_TRANSACT:
+    case FSP_IOCTL_TRANSACT_BATCH:
+    case FSP_IOCTL_TRANSACT_INTERNAL:
+        if (0 != IrpSp->FileObject->FsContext2)
+            Result = FspVolumeTransact(FsctlDeviceObject, Irp, IrpSp);
+        break;
+    }
+
+    return Result;
+}
 
 static NTSTATUS FspFsvrtDeviceControl(
     PDEVICE_OBJECT FsvrtDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
@@ -258,6 +367,8 @@ NTSTATUS FspDeviceControl(
         FSP_RETURN(Result = FspFsvolDeviceControl(DeviceObject, Irp, IrpSp));
     case FspFsvrtDeviceExtensionKind:
         FSP_RETURN(Result = FspFsvrtDeviceControl(DeviceObject, Irp, IrpSp));
+    case FspFsctlDeviceExtensionKind:
+        FSP_RETURN(Result = FspFsctlDeviceControl(DeviceObject, Irp, IrpSp));
     default:
         FSP_RETURN(Result = STATUS_INVALID_DEVICE_REQUEST);
     }

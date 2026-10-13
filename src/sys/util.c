@@ -1,7 +1,7 @@
 /**
  * @file sys/util.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -115,9 +115,12 @@ NTSTATUS FspOplockFsctrl(
     POPLOCK Oplock,
     PIRP Irp,
     ULONG OpenCount);
+FSP_SYNCHRONOUS_WORK_ITEM *FspAllocateSynchronousWorkItem(
+    PWORKER_THREAD_ROUTINE Routine, PVOID Context);
 VOID FspInitializeSynchronousWorkItem(FSP_SYNCHRONOUS_WORK_ITEM *SynchronousWorkItem,
     PWORKER_THREAD_ROUTINE Routine, PVOID Context);
-VOID FspExecuteSynchronousWorkItem(FSP_SYNCHRONOUS_WORK_ITEM *SynchronousWorkItem);
+NTSTATUS FspExecuteSynchronousWorkItem(FSP_SYNCHRONOUS_WORK_ITEM *SynchronousWorkItem,
+    BOOLEAN Alertable);
 static WORKER_THREAD_ROUTINE FspExecuteSynchronousWorkItemRoutine;
 VOID FspInitializeDelayedWorkItem(FSP_DELAYED_WORK_ITEM *DelayedWorkItem,
     PWORKER_THREAD_ROUTINE Routine, PVOID Context);
@@ -131,12 +134,10 @@ NTSTATUS FspIrpHook(PIRP Irp, PIO_COMPLETION_ROUTINE CompletionRoutine, PVOID Ow
 VOID FspIrpHookReset(PIRP Irp);
 PVOID FspIrpHookContext(PVOID Context);
 NTSTATUS FspIrpHookNext(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context);
-VOID FspWgroupInitialize(FSP_WGROUP *Wgroup);
-VOID FspWgroupIncrement(FSP_WGROUP *Wgroup);
-VOID FspWgroupDecrement(FSP_WGROUP *Wgroup);
-VOID FspWgroupSignalPermanently(FSP_WGROUP *Wgroup);
-NTSTATUS FspWgroupWait(FSP_WGROUP *Wgroup,
-    KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER PTimeout);
+LONG FspCompareUnicodeString(
+    PCUNICODE_STRING String1,
+    PCUNICODE_STRING String2,
+    BOOLEAN CaseInsensitive);
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, FspIsNtDdiVersionAvailable)
@@ -169,6 +170,7 @@ NTSTATUS FspWgroupWait(FSP_WGROUP *Wgroup,
 #pragma alloc_text(PAGE, FspCheckOplock)
 #pragma alloc_text(PAGE, FspCheckOplockEx)
 #pragma alloc_text(PAGE, FspOplockFsctrl)
+#pragma alloc_text(PAGE, FspAllocateSynchronousWorkItem)
 #pragma alloc_text(PAGE, FspInitializeSynchronousWorkItem)
 #pragma alloc_text(PAGE, FspExecuteSynchronousWorkItem)
 #pragma alloc_text(PAGE, FspExecuteSynchronousWorkItemRoutine)
@@ -180,13 +182,7 @@ NTSTATUS FspWgroupWait(FSP_WGROUP *Wgroup,
 #pragma alloc_text(PAGE, FspSafeMdlDelete)
 #pragma alloc_text(PAGE, FspIrpHook)
 #pragma alloc_text(PAGE, FspIrpHookReset)
-// !#pragma alloc_text(PAGE, FspIrpHookContext)
-// !#pragma alloc_text(PAGE, FspIrpHookNext)
-// !#pragma alloc_text(PAGE, FspWgroupInitialize)
-// !#pragma alloc_text(PAGE, FspWgroupIncrement)
-// !#pragma alloc_text(PAGE, FspWgroupDecrement)
-// !#pragma alloc_text(PAGE, FspWgroupSignalPermanently)
-// !#pragma alloc_text(PAGE, FspWgroupWait)
+#pragma alloc_text(PAGE, FspCompareUnicodeString)
 #endif
 
 static const LONG Delays[] =
@@ -1131,27 +1127,56 @@ NTSTATUS FspOplockFsctrl(
     return Result;
 }
 
+FSP_SYNCHRONOUS_WORK_ITEM *FspAllocateSynchronousWorkItem(
+    PWORKER_THREAD_ROUTINE Routine, PVOID Context)
+{
+    PAGED_CODE();
+
+    FSP_SYNCHRONOUS_WORK_ITEM *SynchronousWorkItem;
+
+    SynchronousWorkItem = FspAllocNonPaged(sizeof *SynchronousWorkItem);
+    if (0 != SynchronousWorkItem)
+    {
+        FspInitializeSynchronousWorkItem(SynchronousWorkItem, Routine, Context);
+        SynchronousWorkItem->RefCount = 2; /* make it refcounted */
+    }
+
+    return SynchronousWorkItem;
+}
+
 VOID FspInitializeSynchronousWorkItem(FSP_SYNCHRONOUS_WORK_ITEM *SynchronousWorkItem,
     PWORKER_THREAD_ROUTINE Routine, PVOID Context)
 {
     PAGED_CODE();
 
-    KeInitializeEvent(&SynchronousWorkItem->Event, NotificationEvent, FALSE);
+    SynchronousWorkItem->RefCount = 0; /* initialize as non-refcounted */
     SynchronousWorkItem->Routine = Routine;
     SynchronousWorkItem->Context = Context;
+    KeInitializeEvent(&SynchronousWorkItem->Event, NotificationEvent, FALSE);
     ExInitializeWorkItem(&SynchronousWorkItem->WorkQueueItem,
         FspExecuteSynchronousWorkItemRoutine, SynchronousWorkItem);
 }
 
-VOID FspExecuteSynchronousWorkItem(FSP_SYNCHRONOUS_WORK_ITEM *SynchronousWorkItem)
+NTSTATUS FspExecuteSynchronousWorkItem(FSP_SYNCHRONOUS_WORK_ITEM *SynchronousWorkItem,
+    BOOLEAN Alertable)
 {
     PAGED_CODE();
 
-    ExQueueWorkItem(&SynchronousWorkItem->WorkQueueItem, CriticalWorkQueue);
-
     NTSTATUS Result;
-    Result = KeWaitForSingleObject(&SynchronousWorkItem->Event, Executive, KernelMode, FALSE, 0);
-    ASSERT(STATUS_SUCCESS == Result);
+
+    /* Alertable=TRUE requires item allocated by FspAllocateSynchronousWorkItem */
+    ASSERT(!Alertable || 0 < SynchronousWorkItem->RefCount);
+
+    ExQueueWorkItem(&SynchronousWorkItem->WorkQueueItem, CriticalWorkQueue);
+    Result = KeWaitForSingleObject(&SynchronousWorkItem->Event, Executive, KernelMode, Alertable, 0);
+
+    if (0 < SynchronousWorkItem->RefCount)
+    {
+        if (0 == InterlockedDecrement(&SynchronousWorkItem->RefCount))
+            FspFree(SynchronousWorkItem);
+    }
+
+    return Result;
 }
 
 static VOID FspExecuteSynchronousWorkItemRoutine(PVOID Context)
@@ -1159,8 +1184,15 @@ static VOID FspExecuteSynchronousWorkItemRoutine(PVOID Context)
     PAGED_CODE();
 
     FSP_SYNCHRONOUS_WORK_ITEM *SynchronousWorkItem = Context;
+
     SynchronousWorkItem->Routine(SynchronousWorkItem->Context);
     KeSetEvent(&SynchronousWorkItem->Event, 1, FALSE);
+
+    if (0 < SynchronousWorkItem->RefCount)
+    {
+        if (0 == InterlockedDecrement(&SynchronousWorkItem->RefCount))
+            FspFree(SynchronousWorkItem);
+    }
 }
 
 VOID FspInitializeDelayedWorkItem(FSP_DELAYED_WORK_ITEM *DelayedWorkItem,
@@ -1507,55 +1539,81 @@ NTSTATUS FspIrpHookNext(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
     return Result;
 }
 
-VOID FspWgroupInitialize(FSP_WGROUP *Wgroup)
+static inline
+USHORT FspUpcaseAscii(USHORT c)
 {
-    // !PAGED_CODE();
-
-    KeInitializeEvent(&Wgroup->Event, NotificationEvent, TRUE);
-    Wgroup->Count = 0;
-    KeInitializeSpinLock(&Wgroup->SpinLock);
+    /*
+     * Bit-twiddling upper case char:
+     *
+     * - Let signbit(x) = x & 0x100 (treat bit 0x100 as "signbit").
+     * - 'A' <= c && c <= 'Z' <=> s = signbit(c - 'A') ^ signbit(c - ('Z' + 1)) == 1
+     *     - c >= 'A' <=> c - 'A' >= 0      <=> signbit(c - 'A') = 0
+     *     - c <= 'Z' <=> c - ('Z' + 1) < 0 <=> signbit(c - ('Z' + 1)) = 1
+     * - Bit 0x20 = 0x100 >> 3 toggles uppercase to lowercase and vice-versa.
+     *
+     * This is actually faster than `(c - 'a' <= 'z' - 'a') ? (c & ~0x20) : c`, even
+     * when compiled using cmov conditional moves at least on this system (i7-1065G7).
+     *
+     * See https://godbolt.org/z/ebv131Wrh
+     */
+    USHORT s = ((c - 'a') ^ (c - ('z' + 1))) & 0x100;
+    return c & ~(s >> 3);
 }
 
-VOID FspWgroupIncrement(FSP_WGROUP *Wgroup)
+#if DBG
+static
+LONG FspCompareUnicodeStringReal(
+    PCUNICODE_STRING S1,
+    PCUNICODE_STRING S2,
+    BOOLEAN CaseInsensitive)
+#else
+LONG FspCompareUnicodeString(
+    PCUNICODE_STRING S1,
+    PCUNICODE_STRING S2,
+    BOOLEAN CaseInsensitive)
+#endif
 {
-    // !PAGED_CODE();
+    PAGED_CODE();
 
-    KIRQL Irql;
+    LONG LResult = S1->Length - S2->Length;
+    PWCH P1 = S1->Buffer;
+    PWCH P2 = S2->Buffer;
+    PWCH EndP1 = P1 + (0 >= LResult ? S1->Length : S2->Length) / sizeof(WCHAR);
 
-    KeAcquireSpinLock(&Wgroup->SpinLock, &Irql);
-    if (0 <= Wgroup->Count && 1 == ++Wgroup->Count)
-        KeClearEvent(&Wgroup->Event);
-    KeReleaseSpinLock(&Wgroup->SpinLock, Irql);
+    if (CaseInsensitive)
+    {
+        for (; EndP1 != P1; ++P1, ++P2)
+        {
+            USHORT C1 = *P1, C2 = *P2;
+            if (0xff80 & (C1 | C2))
+                return RtlCompareUnicodeString(S1, S2, TRUE);
+            C1 = FspUpcaseAscii(C1);
+            C2 = FspUpcaseAscii(C2);
+            if (C1 != C2)
+                return C1 - C2;
+        }
+    }
+    else
+    {
+        for (; EndP1 != P1; ++P1, ++P2)
+        {
+            USHORT C1 = *P1, C2 = *P2;
+            if (C1 != C2)
+                return C1 - C2;
+        }
+    }
+
+    return LResult;
 }
-
-VOID FspWgroupDecrement(FSP_WGROUP *Wgroup)
+#if DBG
+LONG FspCompareUnicodeString(
+    PCUNICODE_STRING S1,
+    PCUNICODE_STRING S2,
+    BOOLEAN CaseInsensitive)
 {
-    // !PAGED_CODE();
-
-    KIRQL Irql;
-
-    KeAcquireSpinLock(&Wgroup->SpinLock, &Irql);
-    if (0 < Wgroup->Count && 0 == --Wgroup->Count)
-        KeSetEvent(&Wgroup->Event, 1, FALSE);
-    KeReleaseSpinLock(&Wgroup->SpinLock, Irql);
+    LONG Result0 = FspCompareUnicodeStringReal(S1, S2, CaseInsensitive);
+    LONG Result1 = RtlCompareUnicodeString(S1, S2, CaseInsensitive);
+    ASSERT((0 < Result0) - (0 > Result0) == (0 < Result1) - (0 > Result1));
+    return Result0;
 }
-
-VOID FspWgroupSignalPermanently(FSP_WGROUP *Wgroup)
-{
-    // !PAGED_CODE();
-
-    KIRQL Irql;
-
-    KeAcquireSpinLock(&Wgroup->SpinLock, &Irql);
-    Wgroup->Count = -1;
-    KeSetEvent(&Wgroup->Event, 1, FALSE);
-    KeReleaseSpinLock(&Wgroup->SpinLock, Irql);
-}
-
-NTSTATUS FspWgroupWait(FSP_WGROUP *Wgroup,
-    KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER PTimeout)
-{
-    // !PAGED_CODE();
-
-    return KeWaitForSingleObject(&Wgroup->Event, Executive, WaitMode, Alertable, PTimeout);
-}
+#endif

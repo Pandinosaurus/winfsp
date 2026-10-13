@@ -1,7 +1,7 @@
 /**
  * @file dll/eventlog.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -100,9 +100,11 @@ NTSTATUS FspEventLogRegister(VOID)
     WCHAR Path[MAX_PATH];
     DWORD RegResult, DwordValue;
     HKEY RegKey;
+    NTSTATUS Result;
 
-    if (0 == GetModuleFileNameW(DllInstance, Path, MAX_PATH))
-        return FspNtStatusFromWin32(GetLastError());
+    Result = FspGetModuleFileName(DllInstance, Path, MAX_PATH, L"" MyEventLogRegisterPath);
+    if (!NT_SUCCESS(Result))
+        return Result;
 
     RegResult = RegCreateKeyExW(
         HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\" FSP_EVENTLOG_NAME,

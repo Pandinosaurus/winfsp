@@ -1,7 +1,7 @@
 /**
  * @file winfsp/fsctl.h
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -91,24 +91,34 @@ extern const __declspec(selectany) GUID FspFsvrtDeviceClassGuid =
 /* fsctl device codes */
 #define FSP_FSCTL_MOUNTDEV              \
     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'M', METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define FSP_FSCTL_MOUNTMGR              \
+    CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'm', METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define FSP_FSCTL_VOLUME_NAME           \
     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'N', METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define FSP_FSCTL_VOLUME_LIST           \
     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'L', METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define FSP_FSCTL_TRANSACT              \
     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'T', METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define FSP_IOCTL_TRANSACT              \
+    CTL_CODE(0x8000 | ('F'<<8) | 'W', 0x800 + 'T', METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define FSP_FSCTL_TRANSACT_BATCH        \
     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 't', METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+#define FSP_IOCTL_TRANSACT_BATCH        \
+    CTL_CODE(0x8000 | ('F'<<8) | 'W', 0x800 + 't', METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define FSP_FSCTL_STOP                  \
     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'S', METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define FSP_FSCTL_STOP0                 \
     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 's', METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define FSP_FSCTL_NOTIFY                \
     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'n', METHOD_NEITHER, FILE_ANY_ACCESS)
+#define FSP_FSCTL_UNLOAD                \
+    CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'U', METHOD_NEITHER, FILE_ANY_ACCESS)
 
 /* fsctl internal device codes (usable only in-kernel) */
 #define FSP_FSCTL_TRANSACT_INTERNAL     \
     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'I', METHOD_NEITHER, FILE_ANY_ACCESS)
+#define FSP_IOCTL_TRANSACT_INTERNAL     \
+    CTL_CODE(0x8000 | ('F'<<8) | 'W', 0x800 + 'I', METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* fsvol device codes */
 #define FSP_FSCTL_QUERY_WINFSP          \
@@ -136,6 +146,8 @@ FSP_FSCTL_STATIC_ASSERT(FSP_FSCTL_VOLUME_NAME_SIZEMAX <= 260 * sizeof(WCHAR),
 #define FSP_FSCTL_TRANSACT_REQ_TOKEN_PID(T)     ((UINT32)(((T) >> 32) & 0xffffffff))
 
 #define FSP_FSCTL_DEVICECONTROL_SIZEMAX (4 * 1024)  /* must be < FSP_FSCTL_TRANSACT_{REQ,RSP}_SIZEMAX */
+
+#define FSP_FSCTL_NOTIFY_INFO_SIZEMAX   (0x7fffffffU)
 
 /* marshalling */
 #pragma warning(push)
@@ -220,9 +232,10 @@ enum
     UINT32 CasePreservedExtendedAttributes:1;   /* preserve case of EA (default is UPPERCASE) */\
     UINT32 WslFeatures:1;                   /* support features required for WSLinux */\
     UINT32 DirectoryMarkerAsNextOffset:1;   /* directory marker is next offset instead of last name */\
-    UINT32 RejectIrpPriorToTransact0:1;     /* reject IRP's prior to FspFsctlTransact with 0 buffers */\
+    UINT32 RejectIrpPriorToTransact0:1;     /* DEPRECATED: reject IRP's prior to FspFsctlTransact0 */\
     UINT32 SupportsPosixUnlinkRename:1;     /* file system supports POSIX-style unlink and rename */\
-    UINT32 KmReservedFlags:2;\
+    UINT32 PostDispositionWhenNecessaryOnly:1;  /* post Disposition for dirs or READONLY attr check */\
+    UINT32 KmReservedFlags:1;\
     WCHAR Prefix[FSP_FSCTL_VOLUME_PREFIX_SIZE / sizeof(WCHAR)]; /* UNC prefix (\Server\Share) */\
     WCHAR FileSystemName[FSP_FSCTL_VOLUME_FSNAME_SIZE / sizeof(WCHAR)];
 #define FSP_FSCTL_VOLUME_PARAMS_V1_FIELD_DEFN\
@@ -672,6 +685,8 @@ FSP_API NTSTATUS FspFsctlCreateVolume(PWSTR DevicePath,
     PHANDLE PVolumeHandle);
 FSP_API NTSTATUS FspFsctlMakeMountdev(HANDLE VolumeHandle,
     BOOLEAN Persistent, GUID *UniqueId);
+FSP_API NTSTATUS FspFsctlUseMountmgr(HANDLE VolumeHandle,
+    PWSTR MountPoint);
 FSP_API NTSTATUS FspFsctlTransact(HANDLE VolumeHandle,
     PVOID ResponseBuf, SIZE_T ResponseBufSize,
     PVOID RequestBuf, SIZE_T *PRequestBufSize,
@@ -683,6 +698,12 @@ FSP_API NTSTATUS FspFsctlNotify(HANDLE VolumeHandle,
 FSP_API NTSTATUS FspFsctlGetVolumeList(PWSTR DevicePath,
     PWCHAR VolumeListBuf, PSIZE_T PVolumeListSize);
 FSP_API NTSTATUS FspFsctlPreflight(PWSTR DevicePath);
+FSP_API NTSTATUS FspFsctlServiceVersion(PUINT32 PVersion);
+FSP_API NTSTATUS FspFsctlStartService(VOID);
+FSP_API NTSTATUS FspFsctlStopService(VOID);
+FSP_API NTSTATUS FspFsctlEnumServices(
+    VOID (*EnumFn)(PVOID Context, PWSTR ServiceName, BOOLEAN Running),
+    PVOID Context);
 
 typedef struct
 {
@@ -698,6 +719,93 @@ typedef struct
 FSP_API NTSTATUS FspMountSet(FSP_MOUNT_DESC *Desc);
 FSP_API NTSTATUS FspMountRemove(FSP_MOUNT_DESC *Desc);
 #endif
+
+/*
+ * Atomics
+ *
+ * See https://www.cl.cam.ac.uk/~pes20/cpp/cpp0xmappings.html (https://archive.is/mJfFX)
+ */
+#if _MSC_VER >= 1920 /* VS2019 or later */
+__int32 __iso_volatile_load32(const volatile __int32 *);
+void __iso_volatile_store32(volatile __int32 *, __int32);
+__int64 __iso_volatile_load64(const volatile __int64 *);
+void __iso_volatile_store64(volatile __int64 *, __int64);
+#define FSP_INTERLOCKED__LOAD32(p)      __iso_volatile_load32(p)
+#define FSP_INTERLOCKED__STORE32(p,v)   __iso_volatile_store32(p,v)
+#define FSP_INTERLOCKED__LOAD64(p)      __iso_volatile_load64(p)
+#define FSP_INTERLOCKED__STORE64(p,v)   __iso_volatile_store64(p,v)
+#else
+#define FSP_INTERLOCKED__LOAD32(p)      (*(p))
+#define FSP_INTERLOCKED__STORE32(p,v)   (*(p) = (v))
+#define FSP_INTERLOCKED__LOAD64(p)      (*(p))
+#define FSP_INTERLOCKED__STORE64(p,v)   (*(p) = (v))
+#endif
+static inline INT32 FspInterlockedLoad32(INT32 volatile *p)
+{
+#if defined(_M_ARM64)
+    void __dmb(unsigned int);
+    INT32 v = FSP_INTERLOCKED__LOAD32(p);
+    __dmb(0xb);
+    return v;
+
+#elif defined(_M_X64) || defined(_M_IX86)
+    void _ReadWriteBarrier(void);
+    INT32 v = FSP_INTERLOCKED__LOAD32(p);
+    _ReadWriteBarrier();
+    return v;
+
+#endif
+}
+static inline VOID FspInterlockedStore32(INT32 volatile *p, INT32 v)
+{
+#if defined(_M_ARM64)
+    void __dmb(unsigned int);
+    __dmb(0xb);
+    FSP_INTERLOCKED__STORE32(p, v);
+    __dmb(0xb);
+
+#elif defined(_M_X64) || defined(_M_IX86)
+    long _InterlockedExchange(long volatile *, long);
+    _InterlockedExchange((long volatile *)p, v);
+
+#endif
+}
+static inline VOID *FspInterlockedLoadPointer(VOID *volatile *p)
+{
+#if defined(_M_ARM64)
+    void __dmb(unsigned int);
+    VOID *v = (VOID *)FSP_INTERLOCKED__LOAD64((__int64 volatile *)(p));
+    __dmb(0xb);
+    return v;
+
+#elif defined(_M_X64)
+    void _ReadWriteBarrier(void);
+    VOID *v = (VOID *)FSP_INTERLOCKED__LOAD64((__int64 volatile *)(p));
+    _ReadWriteBarrier();
+    return v;
+
+#elif defined(_M_IX86)
+    void _ReadWriteBarrier(void);
+    VOID *v = (VOID *)FSP_INTERLOCKED__LOAD32((__int32 volatile *)(p));
+    _ReadWriteBarrier();
+    return v;
+
+#endif
+}
+static inline VOID FspInterlockedStorePointer(VOID *volatile *p, VOID *v)
+{
+#if defined(_M_ARM64)
+    void __dmb(unsigned int);
+    __dmb(0xb);
+    FSP_INTERLOCKED__STORE64((__int64 volatile *)(p), (__int64)(v));
+    __dmb(0xb);
+
+#elif defined(_M_X64) || defined(_M_IX86)
+    void *_InterlockedExchangePointer(void *volatile *, void *);
+    _InterlockedExchangePointer(p, v);
+
+#endif
+}
 
 #ifdef __cplusplus
 }

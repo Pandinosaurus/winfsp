@@ -1,7 +1,7 @@
 /**
  * @file ptfs-main.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -116,14 +116,24 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
             break;
         case L'o':
             argtos(OptionString);
-            if (0 == _wcsicmp(L"ReparsePoints", OptionString))
+            if (0 == _wcsicmp(L"ExtraFeatures", OptionString))
+                FsAttributeMask |=
+                    PtfsReparsePoints |
+                    PtfsNamedStreams |
+                    PtfsExtendedAttributes |
+                    PtfsWslFeatures;
+            else if (0 == _wcsicmp(L"ReparsePoints", OptionString))
                 FsAttributeMask |= PtfsReparsePoints;
             else if (0 == _wcsicmp(L"NamedStreams", OptionString))
                 FsAttributeMask |= PtfsNamedStreams;
             else if (0 == _wcsicmp(L"ExtendedAttributes", OptionString))
                 FsAttributeMask |= PtfsExtendedAttributes;
+            else if (0 == _wcsicmp(L"WslFeatures", OptionString))
+                FsAttributeMask |= PtfsWslFeatures;
             else if (0 == _wcsicmp(L"FlushAndPurgeOnCleanup", OptionString))
                 FsAttributeMask |= PtfsFlushAndPurgeOnCleanup;
+            else if (0 == _wcsicmp(L"SetAllocationSizeOnCleanup", OptionString))
+                FsAttributeMask |= PtfsSetAllocationSizeOnCleanup;
             else
                 goto usage;
             break;
@@ -190,7 +200,7 @@ static NTSTATUS SvcStart(FSP_SERVICE *Service, ULONG argc, PWSTR *argv)
         FspDebugLogSetHandle(DebugLogHandle);
     }
 
-    EnablePrivileges(SE_BACKUP_NAME, SE_RESTORE_NAME, SE_CREATE_SYMBOLIC_LINK_NAME, 0);
+    EnablePrivileges(SE_SECURITY_NAME, SE_BACKUP_NAME, SE_RESTORE_NAME, SE_CREATE_SYMBOLIC_LINK_NAME, 0);
 
     Result = PtfsCreate(
         RootPath,
@@ -240,10 +250,11 @@ usage:
         "    -d DebugFlags       [-1: enable all debug logs]\n"
         "    -D DebugLogFile     [file path; use - for stderr]\n"
         "    -t FileInfoTimeout  [millis]\n"
-        "    -o ReparsePoints\n"
-        "    -o NamedStreams\n"
-        "    -o ExtendedAttributes\n"
-        "    -o FlushAndPurgeOnCleanup\n"
+        "    -o ExtraFeatures    [extra Windows file system features]\n"
+        "        -o ReparsePoints\n"
+        "        -o NamedStreams\n"
+        "        -o ExtendedAttributes\n"
+        "        -o WslFeatures\n"
         "    -u \\Server\\Share    [UNC prefix (single backslash)]\n"
         "    -p Directory        [directory to expose as pass through file system]\n"
         "    -m MountPoint       [X:|*|directory]\n";

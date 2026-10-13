@@ -1,7 +1,7 @@
 /**
  * @file passthrough.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -62,7 +62,8 @@ static NTSTATUS GetFileInfoInternal(HANDLE Handle, FSP_FSCTL_FILE_INFO *FileInfo
     FileInfo->LastAccessTime = ((PLARGE_INTEGER)&ByHandleFileInfo.ftLastAccessTime)->QuadPart;
     FileInfo->LastWriteTime = ((PLARGE_INTEGER)&ByHandleFileInfo.ftLastWriteTime)->QuadPart;
     FileInfo->ChangeTime = FileInfo->LastWriteTime;
-    FileInfo->IndexNumber = 0;
+    FileInfo->IndexNumber =
+        ((UINT64)ByHandleFileInfo.nFileIndexHigh << 32) | (UINT64)ByHandleFileInfo.nFileIndexLow;
     FileInfo->HardLinks = 0;
 
     return STATUS_SUCCESS;
@@ -625,7 +626,7 @@ static VOID PtfsDelete(PTFS *Ptfs);
 static NTSTATUS PtfsCreate(PWSTR Path, PWSTR VolumePrefix, PWSTR MountPoint, UINT32 DebugFlags,
     PTFS **PPtfs)
 {
-    WCHAR FullPath[MAX_PATH];
+    WCHAR FullPath[FULLPATH_SIZE];
     ULONG Length;
     HANDLE Handle;
     FILETIME CreationTime;

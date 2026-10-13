@@ -1,7 +1,7 @@
 /**
  * @file sys/mup.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -43,6 +43,8 @@ NTSTATUS FspMupRegister(
     PDEVICE_OBJECT FsmupDeviceObject, PDEVICE_OBJECT FsvolDeviceObject);
 VOID FspMupUnregister(
     PDEVICE_OBJECT FsmupDeviceObject, PDEVICE_OBJECT FsvolDeviceObject);
+PDEVICE_OBJECT FspMupGetFsvolDeviceObject(
+    PFILE_OBJECT FileObject);
 NTSTATUS FspMupHandleIrp(
     PDEVICE_OBJECT FsmupDeviceObject, PIRP Irp);
 static NTSTATUS FspMupRedirQueryPathEx(
@@ -52,6 +54,7 @@ static NTSTATUS FspMupRedirQueryPathEx(
 #pragma alloc_text(PAGE, FspMupGetClassName)
 #pragma alloc_text(PAGE, FspMupRegister)
 #pragma alloc_text(PAGE, FspMupUnregister)
+#pragma alloc_text(PAGE, FspMupGetFsvolDeviceObject)
 #pragma alloc_text(PAGE, FspMupHandleIrp)
 #pragma alloc_text(PAGE, FspMupRedirQueryPathEx)
 #endif
@@ -118,7 +121,7 @@ NTSTATUS FspMupRegister(
     Class->Name.Buffer = Class->Buffer;
     RtlCopyMemory(Class->Buffer, ClassName.Buffer, ClassName.Length);
 
-    ExAcquireResourceExclusiveLite(&FsmupDeviceExtension->PrefixTableResource, TRUE);
+    FspFsmupDeviceLockPrefixTable(FsmupDeviceObject);
     Success = RtlInsertUnicodePrefix(&FsmupDeviceExtension->PrefixTable,
         &FsvolDeviceExtension->VolumePrefix, &FsvolDeviceExtension->VolumePrefixEntry);
     if (Success)
@@ -141,7 +144,7 @@ NTSTATUS FspMupRegister(
     }
     else
         Result = STATUS_OBJECT_NAME_COLLISION;
-    ExReleaseResourceLite(&FsmupDeviceExtension->PrefixTableResource);
+    FspFsmupDeviceUnlockPrefixTable(FsmupDeviceObject);
 
 exit:
     if (0 != Class)
@@ -166,7 +169,7 @@ VOID FspMupUnregister(
     Result = FspMupGetClassName(&FsvolDeviceExtension->VolumePrefix, &ClassName);
     ASSERT(NT_SUCCESS(Result));
 
-    ExAcquireResourceExclusiveLite(&FsmupDeviceExtension->PrefixTableResource, TRUE);
+    FspFsmupDeviceLockPrefixTable(FsmupDeviceObject);
     PrefixEntry = RtlFindUnicodePrefix(&FsmupDeviceExtension->PrefixTable,
         &FsvolDeviceExtension->VolumePrefix, 0);
     if (0 != PrefixEntry)
@@ -188,7 +191,28 @@ VOID FspMupUnregister(
             }
         }
     }
-    ExReleaseResourceLite(&FsmupDeviceExtension->PrefixTableResource);
+    FspFsmupDeviceUnlockPrefixTable(FsmupDeviceObject);
+}
+
+PDEVICE_OBJECT FspMupGetFsvolDeviceObject(
+    PFILE_OBJECT FileObject)
+{
+    PAGED_CODE();
+
+    PDEVICE_OBJECT FsvolDeviceObject = 0;
+
+    ASSERT(0 != FileObject);
+
+    if (FspFileNodeIsValid(FileObject->FsContext))
+        FsvolDeviceObject = ((FSP_FILE_NODE*)FileObject->FsContext)->FsvolDeviceObject;
+    else if (0 != FileObject->FsContext2 &&
+#pragma prefast(disable:28175, "We are a filesystem: ok to access DeviceObject->Type")
+        IO_TYPE_DEVICE == ((PDEVICE_OBJECT)FileObject->FsContext2)->Type &&
+        0 != ((PDEVICE_OBJECT)FileObject->FsContext2)->DeviceExtension &&
+        FspFsvolDeviceExtensionKind == FspDeviceExtension((PDEVICE_OBJECT)FileObject->FsContext2)->Kind)
+        FsvolDeviceObject = (PDEVICE_OBJECT)FileObject->FsContext2;
+
+    return FsvolDeviceObject;
 }
 
 NTSTATUS FspMupHandleIrp(
@@ -213,7 +237,8 @@ NTSTATUS FspMupHandleIrp(
          * A CREATE request with an empty file name indicates that the fsmup device
          * is being opened. Check for this case and handle it.
          */
-        if (0 == FileObject->FileName.Length)
+        if (0 == FileObject->FileName.Length &&
+            0 == FileObject->RelatedFileObject)
         {
             Irp->IoStatus.Status = STATUS_SUCCESS;
             Irp->IoStatus.Information = FILE_OPENED;
@@ -227,9 +252,12 @@ NTSTATUS FspMupHandleIrp(
          */
 
         if (0 != FileObject->RelatedFileObject)
-            FileObject = FileObject->RelatedFileObject;
+        {
+            FsvolDeviceObject = FspMupGetFsvolDeviceObject(FileObject->RelatedFileObject);
+            break;
+        }
 
-        ExAcquireResourceExclusiveLite(&FsmupDeviceExtension->PrefixTableResource, TRUE);
+        FspFsmupDeviceLockPrefixTable(FsmupDeviceObject);
         PrefixEntry = RtlFindUnicodePrefix(&FsmupDeviceExtension->PrefixTable,
             &FileObject->FileName, 0);
         if (0 != PrefixEntry)
@@ -239,7 +267,7 @@ NTSTATUS FspMupHandleIrp(
             FspDeviceReference(FsvolDeviceObject);
             DeviceDeref = TRUE;
         }
-        ExReleaseResourceLite(&FsmupDeviceExtension->PrefixTableResource);
+        FspFsmupDeviceUnlockPrefixTable(FsmupDeviceObject);
         break;
 
     case IRP_MJ_DEVICE_CONTROL:
@@ -276,7 +304,7 @@ NTSTATUS FspMupHandleIrp(
                 FsvolDeviceObject = ((FSP_FILE_NODE *)FileObject->FsContext)->FsvolDeviceObject;
             else if (0 != FileObject->FsContext2 &&
 #pragma prefast(disable:28175, "We are a filesystem: ok to access DeviceObject->Type")
-                3 == ((PDEVICE_OBJECT)FileObject->FsContext2)->Type &&
+                IO_TYPE_DEVICE == ((PDEVICE_OBJECT)FileObject->FsContext2)->Type &&
                 0 != ((PDEVICE_OBJECT)FileObject->FsContext2)->DeviceExtension &&
                 FspFsvolDeviceExtensionKind == FspDeviceExtension((PDEVICE_OBJECT)FileObject->FsContext2)->Kind)
                 FsvolDeviceObject = (PDEVICE_OBJECT)FileObject->FsContext2;
@@ -395,19 +423,19 @@ static NTSTATUS FspMupRedirQueryPathEx(
         return STATUS_BAD_NETWORK_PATH;
 
     Result = STATUS_BAD_NETWORK_PATH;
-    ExAcquireResourceExclusiveLite(&FsmupDeviceExtension->PrefixTableResource, TRUE);
+    FspFsmupDeviceLockPrefixTable(FsmupDeviceObject);
     Entry = RtlFindUnicodePrefix(&FsmupDeviceExtension->ClassTable, &ClassName, 0);
     if (0 != Entry)
     {
         QueryPathResponse->LengthAccepted = ClassName.Length;
         Result = STATUS_SUCCESS;
     }
-    ExReleaseResourceLite(&FsmupDeviceExtension->PrefixTableResource);
+    FspFsmupDeviceUnlockPrefixTable(FsmupDeviceObject);
 #else
     FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension;
 
     Result = STATUS_BAD_NETWORK_PATH;
-    ExAcquireResourceExclusiveLite(&FsmupDeviceExtension->PrefixTableResource, TRUE);
+    FspFsmupDeviceLockPrefixTable(FsmupDeviceObject);
     Entry = RtlFindUnicodePrefix(&FsmupDeviceExtension->PrefixTable,
         &QueryPathRequest->PathName, 0);
     if (0 != Entry)
@@ -426,7 +454,7 @@ static NTSTATUS FspMupRedirQueryPathEx(
             }
         }
     }
-    ExReleaseResourceLite(&FsmupDeviceExtension->PrefixTableResource);
+    FspFsmupDeviceUnlockPrefixTable(FsmupDeviceObject);
 #endif
 
     return Result;

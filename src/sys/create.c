@@ -1,7 +1,7 @@
 /**
  * @file sys/create.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -116,7 +116,11 @@ static NTSTATUS FspFsctlCreate(
     if (0 == FileObject->RelatedFileObject &&
         PREFIXW_SIZE <= FileObject->FileName.Length &&
         RtlEqualMemory(PREFIXW, FileObject->FileName.Buffer, PREFIXW_SIZE))
+    {
         Result = FspVolumeCreate(DeviceObject, Irp, IrpSp);
+        if (NT_SUCCESS(Result) && 0 != IrpSp->FileObject->FsContext2)
+            FspDeviceReference(IrpSp->FileObject->FsContext2);
+    }
     else
     {
         Result = STATUS_SUCCESS;
@@ -294,6 +298,8 @@ static NTSTATUS FspFsvolCreateNoLock(
     ULONG CreateOptions = IrpSp->Parameters.Create.Options;
     USHORT FileAttributes = IrpSp->Parameters.Create.FileAttributes;
     PSECURITY_DESCRIPTOR SecurityDescriptor = AccessState->SecurityDescriptor;
+    BOOLEAN SecurityDescriptorRelative = 0 != SecurityDescriptor &&
+        BooleanFlagOn(((SECURITY_DESCRIPTOR *)SecurityDescriptor)->Control, SE_SELF_RELATIVE);
     ULONG SecurityDescriptorSize = 0;
     UINT64 AllocationSize = Irp->Overlay.AllocationSize.QuadPart;
     UINT64 AllocationUnit;
@@ -402,7 +408,10 @@ static NTSTATUS FspFsvolCreateNoLock(
         if (!RtlValidSecurityDescriptor(SecurityDescriptor))
             return STATUS_INVALID_PARAMETER;
 #endif
-        SecurityDescriptorSize = RtlLengthSecurityDescriptor(SecurityDescriptor);
+        if (SecurityDescriptorRelative)
+            SecurityDescriptorSize = RtlLengthSecurityDescriptor(SecurityDescriptor);
+        else
+            RtlAbsoluteToSelfRelativeSD(SecurityDescriptor, 0, &SecurityDescriptorSize);
     }
 
     /* align allocation size */
@@ -698,8 +707,18 @@ static NTSTATUS FspFsvolCreateNoLock(
 
     /* copy the security descriptor (if any) into the request */
     if (0 != SecurityDescriptorSize)
-        RtlCopyMemory(Request->Buffer + Request->Req.Create.SecurityDescriptor.Offset,
-            SecurityDescriptor, SecurityDescriptorSize);
+    {
+        if (SecurityDescriptorRelative)
+            RtlCopyMemory(
+                Request->Buffer + Request->Req.Create.SecurityDescriptor.Offset,
+                SecurityDescriptor,
+                SecurityDescriptorSize);
+        else
+            RtlAbsoluteToSelfRelativeSD(
+                SecurityDescriptor,
+                (PSECURITY_DESCRIPTOR)(Request->Buffer + Request->Req.Create.SecurityDescriptor.Offset),
+                &SecurityDescriptorSize);
+    }
 
     /* copy the extra buffer (if any) into the request */
     if (0 != ExtraBuffer)

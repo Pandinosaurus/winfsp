@@ -1,7 +1,7 @@
 /**
  * @file dll/fuse/fuse.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -82,6 +82,8 @@ static struct fuse_opt fsp_fuse_core_opts[] =
     FUSE_OPT_KEY("fstypename=", 'F'),
     FUSE_OPT_KEY("volname=", 'v'),
 
+    FUSE_OPT_KEY("uidmap=", 'm'),
+
     FSP_FUSE_CORE_OPT("SectorSize=%hu", VolumeParams.SectorSize, 4096),
     FSP_FUSE_CORE_OPT("SectorsPerAllocationUnit=%hu", VolumeParams.SectorsPerAllocationUnit, 1),
     FSP_FUSE_CORE_OPT("MaxComponentLength=%hu", VolumeParams.MaxComponentLength, 0),
@@ -96,6 +98,7 @@ static struct fuse_opt fsp_fuse_core_opts[] =
     FSP_FUSE_CORE_OPT("VolumeInfoTimeout=", set_VolumeInfoTimeout, 1),
     FSP_FUSE_CORE_OPT("VolumeInfoTimeout=%d", VolumeParams.VolumeInfoTimeout, 0),
     FSP_FUSE_CORE_OPT("KeepFileCache=", set_KeepFileCache, 1),
+    FSP_FUSE_CORE_OPT("FlushOnCleanup=", set_FlushOnCleanup, 1),
     FSP_FUSE_CORE_OPT("LegacyUnlinkRename=", set_LegacyUnlinkRename, 1),
     FSP_FUSE_CORE_OPT("ThreadCount=%u", ThreadCount, 0),
     FUSE_OPT_KEY("UNC=", 'U'),
@@ -117,6 +120,8 @@ static struct fuse_opt fsp_fuse_core_opts[] =
     FUSE_OPT_KEY("GroupName=", 'g'),
     FSP_FUSE_CORE_OPT("--GroupName=", set_gid, 1),
     FUSE_OPT_KEY("--GroupName=", 'g'),
+    
+    FSP_FUSE_CORE_OPT("AddWriteEaAccess", add_write_ea_access, 1),
 
     FUSE_OPT_END,
 };
@@ -178,7 +183,7 @@ FSP_FUSE_API struct fuse_chan *fsp_fuse_mount(struct fsp_fuse_env *env,
     const char *mountpoint, struct fuse_args *args)
 {
     struct fuse_chan *ch = 0;
-    WCHAR TempMountPointBuf[MAX_PATH], MountPointBuf[MAX_PATH];
+    WCHAR TempMountPointBuf[MAX_PATH], MountPointBuf[MAX_PATH + 4];
     int Size;
 
     if (0 == mountpoint || '\0' == mountpoint[0] ||
@@ -209,6 +214,33 @@ FSP_FUSE_API struct fuse_chan *fsp_fuse_mount(struct fsp_fuse_env *env,
         MountPointBuf[5] = ':';
         MountPointBuf[6] = '\0';
         Size = 7 * sizeof(WCHAR);
+    }
+    else if (
+        (
+            '\\' == mountpoint[0] &&
+            '\\' == mountpoint[1] &&
+            ('?' == mountpoint[2] || '.' == mountpoint[2]) &&
+            '\\' == mountpoint[3]
+        ) &&
+        (
+            ('A' <= mountpoint[4] && mountpoint[4] <= 'Z') ||
+            ('a' <= mountpoint[4] && mountpoint[4] <= 'z')
+        ) &&
+        ':' == mountpoint[5] && '\\' == mountpoint[6])
+    {
+        MountPointBuf[0] = '\\';
+        MountPointBuf[1] = '\\';
+        MountPointBuf[2] = mountpoint[2];
+        MountPointBuf[3] = '\\';
+
+        Size = 0;
+        if (0 != MultiByteToWideChar(CP_UTF8, 0, mountpoint + 4, -1, TempMountPointBuf, MAX_PATH))
+            Size = GetFullPathNameW(TempMountPointBuf, MAX_PATH, MountPointBuf + 4, 0);
+
+        if (0 == Size || MAX_PATH <= Size)
+            goto fail;
+
+        Size = (Size + 4 + 1) * sizeof(WCHAR);
     }
     else if (
         (
@@ -293,41 +325,239 @@ static int fsp_fuse_sddl_to_security(const char *Sddl, PUINT8 Security, PULONG P
     return res;
 }
 
-static int fsp_fuse_username_to_uid(const char *username, int *puid)
+static int fsp_fuse_tokenuser_to_sid(HANDLE Token, PSID Sid, PULONG PSidSize)
+{
+    union
+    {
+        TOKEN_USER V;
+        UINT8 B[128];
+    } InfoBuf;
+    PTOKEN_USER InfoPtr = &InfoBuf.V;
+    DWORD Size;
+    int res = -1;
+
+    if (!GetTokenInformation(Token, TokenUser, InfoPtr, sizeof InfoBuf, &Size))
+    {
+        if (ERROR_INSUFFICIENT_BUFFER != GetLastError())
+            goto exit;
+
+        InfoPtr = MemAlloc(Size);
+        if (0 == InfoPtr)
+            goto exit;
+
+        if (!GetTokenInformation(Token, TokenUser, InfoPtr, Size, &Size))
+            goto exit;
+    }
+
+    Size = GetLengthSid(InfoPtr->User.Sid);
+    if (*PSidSize >= Size)
+    {
+        memcpy(Sid, InfoPtr->User.Sid, Size);
+        *PSidSize = Size;
+
+        res = 0;
+    }
+
+exit:
+    if (InfoPtr != &InfoBuf.V)
+        MemFree(InfoPtr);
+
+    return res;
+}
+
+static int fsp_fuse_tokenuser_is_azuread(HANDLE Token)
 {
     union
     {
         SID V;
         UINT8 B[SECURITY_MAX_SID_SIZE];
     } SidBuf;
+    ULONG Size;
+    PSID Sid = &SidBuf.V;
+    BYTE Count, Authority;
+    UINT32 SubAuthority0;
+
+    Size = sizeof SidBuf;
+    if (-1 == fsp_fuse_tokenuser_to_sid(Token, &SidBuf.V, &Size))
+        return 0;
+
+    Count = *GetSidSubAuthorityCount(Sid);
+    Authority = GetSidIdentifierAuthority(Sid)->Value[5];
+    SubAuthority0 = 2 <= Count ? *GetSidSubAuthority(Sid, 0) : 0;
+
+    return 12 == Authority && 1 == SubAuthority0;
+}
+
+static int fsp_fuse_username_to_sid(const char *UserName, PSID Sid, PULONG PSidSize)
+{
+    union
+    {
+        SID V;
+        UINT8 B[SECURITY_MAX_SID_SIZE];
+    } SidBuf;
+    PSID SidPtr = &SidBuf.V;
     char Name[256], Domn[256];
-    DWORD SidSize, NameSize, DomnSize;
+    DWORD Size, NameSize, DomnSize;
     SID_NAME_USE Use;
+    int res = -1;
+
+    if ('S' == UserName[0] && '-' == UserName[1] && '1' == UserName[2] && '-' == UserName[3])
+    {
+        if (!ConvertStringSidToSidA(UserName, &SidPtr))
+            goto exit;
+    }
+    else
+    {
+        NameSize = lstrlenA(UserName) + 1;
+        if (sizeof Name / sizeof Name[0] < NameSize)
+            goto exit;
+        memcpy(Name, UserName, NameSize);
+        for (PSTR P = Name, EndP = P + NameSize; EndP > P; P++)
+            if ('+' == *P)
+                *P = '\\';
+
+        Size = sizeof SidBuf;
+        DomnSize = sizeof Domn / sizeof Domn[0];
+        if (!LookupAccountNameA(0, Name, SidPtr, &Size, Domn, &DomnSize, &Use))
+            goto exit;
+    }
+
+    Size = GetLengthSid(SidPtr);
+    if (*PSidSize >= Size)
+    {
+        memcpy(Sid, SidPtr, Size);
+        *PSidSize = Size;
+
+        res = 0;
+    }
+
+exit:
+    if (SidPtr != &SidBuf.V)
+        LocalFree(SidPtr);
+
+    return res;
+}
+
+static int fsp_fuse_username_to_uid(const char *UserName, int *PUid)
+{
+    union
+    {
+        SID V;
+        UINT8 B[SECURITY_MAX_SID_SIZE];
+    } SidBuf;
+    ULONG SidSize;
     UINT32 Uid;
     NTSTATUS Result;
 
-    *puid = 0;
-
-    NameSize = lstrlenA(username) + 1;
-    if (sizeof Name / sizeof Name[0] < NameSize)
-        return -1;
-    memcpy(Name, username, NameSize);
-    for (PSTR P = Name, EndP = P + NameSize; EndP > P; P++)
-        if ('+' == *P)
-            *P = '\\';
+    *PUid = 0;
 
     SidSize = sizeof SidBuf;
-    DomnSize = sizeof Domn / sizeof Domn[0];
-    if (!LookupAccountNameA(0, Name, &SidBuf, &SidSize, Domn, &DomnSize, &Use))
+    if (-1 == fsp_fuse_username_to_sid(UserName, &SidBuf.V, &SidSize))
         return -1;
 
-    Result = FspPosixMapSidToUid(&SidBuf, &Uid);
+    Result = FspPosixMapSidToUid(&SidBuf.V, &Uid);
     if (!NT_SUCCESS(Result))
         return -1;
 
-    *puid = Uid;
+    *PUid = Uid;
 
     return 0;
+}
+
+static int fsp_fuse_set_uidmap(const char *Spec)
+{
+    char Buf[1024], *P = Buf, *UidP, *UserP, C;
+    int Len;
+    UINT32 Uid[8];
+    PSID Sid[8];
+    union
+    {
+        SID V;
+        UINT8 B[SECURITY_MAX_SID_SIZE];
+    } SidBuf[8];
+    ULONG SidSize;
+    ULONG Count;
+    NTSTATUS Result;
+    int res = -1;
+
+    Len = lstrlenA(Spec);
+    if (sizeof Buf <= Len)
+        return -1;
+    memcpy(Buf, Spec, Len + 1);
+
+    Count = 0;
+    for (;;)
+    {
+        if (sizeof Uid / sizeof Uid[0] <= Count)
+        {
+            /* out of space */
+            goto exit;
+        }
+
+        UidP = P;
+        for (; '\0' != (C = *P) && ';' != C && ':' != C; P++)
+            ;
+        *P = '\0';
+
+        if (UidP == P)
+            break;
+
+        Uid[Count] = strtouint(UidP, 0, 10, 0);
+        if (0 == Uid[Count])
+        {
+            /* invalid uid */
+            goto exit;
+        }
+
+        UserP = 0;
+        if (':' == C)
+        {
+            UserP = ++P;
+            for (; '\0' != (C = *P) && ';' != C; P++)
+                ;
+            *P = '\0';
+        }
+
+        if (0 != UserP && '\0' != *UserP)
+        {
+            SidSize = sizeof SidBuf[Count];
+            if (-1 == fsp_fuse_username_to_sid(UserP, &SidBuf[Count].V, &SidSize))
+            {
+                /* invalid SID */
+                goto exit;
+            }
+            Sid[Count] = &SidBuf[Count].V;
+        }
+        else
+        {
+            HANDLE Token;
+            if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &Token))
+            {
+                SidSize = sizeof SidBuf[Count];
+                if (-1 == fsp_fuse_tokenuser_to_sid(Token, &SidBuf[Count].V, &SidSize))
+                {
+                    /* invalid SID */
+                    CloseHandle(Token);
+                    goto exit;
+                }
+                CloseHandle(Token);
+                Sid[Count] = &SidBuf[Count].V;
+            }
+        }
+
+        Count++;
+
+        if ('\0' == C)
+            break;
+
+        P++;
+    }
+
+    Result = FspPosixSetUidMap(Uid, Sid, Count);
+    res = NT_SUCCESS(Result) ? 0 : -1;
+
+exit:
+    return res;
 }
 
 static int fsp_fuse_utf8towcs_trunc(
@@ -424,6 +654,7 @@ static int fsp_fuse_core_opt_proc(void *opt_data0, const char *arg, int key,
             "    -o KeepFileCache           do not discard cache when files are closed\n"
             "    -o LegacyUnlinkRename      do not support new POSIX unlink/rename\n"
             "    -o ThreadCount             number of file system dispatcher threads\n"
+            "    -o uidmap=UID:SID[;...]    explicit UID <-> SID map (max 8 entries)\n"
             );
         opt_data->help = 1;
         return 1;
@@ -531,6 +762,14 @@ static int fsp_fuse_core_opt_proc(void *opt_data0, const char *arg, int key,
         if (0 == opt_data->VolumeLabelLength)
             return -1;
         return 0;
+    case 'm':
+        arg += sizeof "uidmap=" - 1;
+        if (-1 == fsp_fuse_set_uidmap(arg))
+        {
+            opt_data->set_uidmap = -1;
+            return -1;
+        }
+        return 0;
     }
 }
 
@@ -579,6 +818,11 @@ FSP_FUSE_API struct fuse *fsp_fuse_new(struct fsp_fuse_env *env,
             ErrorMessage = L": invalid user or group name.";
             goto fail;
         }
+        else if (-1 == opt_data.set_uidmap)
+        {
+            ErrorMessage = L": invalid uidmap.";
+            goto fail;
+        }
         return 0;
     }
     if (opt_data.help)
@@ -601,6 +845,10 @@ FSP_FUSE_API struct fuse *fsp_fuse_new(struct fsp_fuse_env *env,
 
         if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &Token))
         {
+            /* if an AzureAD user and no uidmap specified, set a default uidmap that matches Cygwin */
+            if (!opt_data.set_uidmap && fsp_fuse_tokenuser_is_azuread(Token))
+                fsp_fuse_set_uidmap("4096:");
+
             fsp_fuse_get_token_uidgid(Token, TokenUser,
                 opt_data.set_uid && -1 == opt_data.uid ? &opt_data.uid : 0,
                 opt_data.set_gid && -1 == opt_data.gid ? &opt_data.gid : 0);
@@ -635,7 +883,7 @@ FSP_FUSE_API struct fuse *fsp_fuse_new(struct fsp_fuse_env *env,
     opt_data.VolumeParams.ReparsePointsAccessCheck = FALSE;
     opt_data.VolumeParams.NamedStreams = FALSE;
     opt_data.VolumeParams.ReadOnlyVolume = FALSE;
-    opt_data.VolumeParams.PostCleanupWhenModifiedOnly = TRUE;
+    opt_data.VolumeParams.PostCleanupWhenModifiedOnly = !opt_data.set_FlushOnCleanup;
     opt_data.VolumeParams.PassQueryDirectoryFileName = TRUE;
     opt_data.VolumeParams.DeviceControl = TRUE;
 #if defined(FSP_CFG_REJECT_EARLY_IRP)
@@ -657,9 +905,11 @@ FSP_FUSE_API struct fuse *fsp_fuse_new(struct fsp_fuse_env *env,
     f->set_create_dir_umask = opt_data.set_create_dir_umask; f->create_dir_umask = opt_data.create_dir_umask;
     f->set_uid = opt_data.set_uid; f->uid = opt_data.uid;
     f->set_gid = opt_data.set_gid; f->gid = opt_data.gid;
+    f->add_write_ea_access = opt_data.add_write_ea_access;
     f->rellinks = opt_data.rellinks;
     f->dothidden = opt_data.dothidden;
     f->ThreadCount = opt_data.ThreadCount;
+    f->FlushOnCleanup = !!opt_data.set_FlushOnCleanup;
     memcpy(&f->ops, ops, opsize);
     f->data = data;
     f->DebugLog = opt_data.debug ? -1 : 0;

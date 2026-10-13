@@ -1,7 +1,7 @@
 /**
  * @file sys/file.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -121,6 +121,7 @@ NTSTATUS FspMainFileOpen(
 NTSTATUS FspMainFileClose(
     HANDLE MainFileHandle,
     PFILE_OBJECT MainFileObject);
+static WORKER_THREAD_ROUTINE FspMainFileCloseSynchronousWork;
 VOID FspFileNodeOplockPrepare(PVOID Context, PIRP Irp);
 VOID FspFileNodeOplockComplete(PVOID Context, PIRP Irp);
 
@@ -183,6 +184,7 @@ VOID FspFileNodeOplockComplete(PVOID Context, PIRP Irp);
 #pragma alloc_text(PAGE, FspFileDescSetDirectoryMarker)
 #pragma alloc_text(PAGE, FspMainFileOpen)
 #pragma alloc_text(PAGE, FspMainFileClose)
+#pragma alloc_text(PAGE, FspMainFileCloseSynchronousWork)
 #pragma alloc_text(PAGE, FspFileNodeOplockPrepare)
 #pragma alloc_text(PAGE, FspFileNodeOplockComplete)
 #endif
@@ -342,7 +344,7 @@ NTSTATUS FspFileNodeCreate(PDEVICE_OBJECT DeviceObject,
     RtlZeroMemory(FileNode, sizeof *FileNode + ExtraSize);
     FileNode->Header.NodeTypeCode = FspFileNodeFileKind;
     FileNode->Header.NodeByteSize = sizeof *FileNode;
-    FileNode->Header.IsFastIoPossible = FastIoIsNotPossible;
+    FileNode->Header.IsFastIoPossible = FastIoIsQuestionable;
     FileNode->Header.Resource = &NonPaged->Resource;
     FileNode->Header.PagingIoResource = &NonPaged->PagingIoResource;
     FileNode->Header.ValidDataLength.QuadPart = MAXLONGLONG;
@@ -407,8 +409,10 @@ VOID FspFileNodeAcquireSharedF(FSP_FILE_NODE *FileNode, ULONG Flags)
     if (Flags & FspFileNodeAcquireMain)
         ExAcquireResourceSharedLite(FileNode->Header.Resource, TRUE);
 
+#if !defined(FSP_FILE_NODE_NO_PGIO)
     if (Flags & FspFileNodeAcquirePgio)
         ExAcquireResourceSharedLite(FileNode->Header.PagingIoResource, TRUE);
+#endif
 
     FSP_FILE_NODE_SET_FLAGS();
 }
@@ -432,6 +436,7 @@ BOOLEAN FspFileNodeTryAcquireSharedF(FSP_FILE_NODE *FileNode, ULONG Flags, BOOLE
             return FALSE;
     }
 
+#if !defined(FSP_FILE_NODE_NO_PGIO)
     if (Flags & FspFileNodeAcquirePgio)
     {
         Result = ExAcquireResourceSharedLite(FileNode->Header.PagingIoResource, Wait);
@@ -442,6 +447,7 @@ BOOLEAN FspFileNodeTryAcquireSharedF(FSP_FILE_NODE *FileNode, ULONG Flags, BOOLE
             return FALSE;
         }
     }
+#endif
 
     if (Result)
         FSP_FILE_NODE_SET_FLAGS();
@@ -462,8 +468,10 @@ VOID FspFileNodeAcquireExclusiveF(FSP_FILE_NODE *FileNode, ULONG Flags)
     if (Flags & FspFileNodeAcquireMain)
         ExAcquireResourceExclusiveLite(FileNode->Header.Resource, TRUE);
 
+#if !defined(FSP_FILE_NODE_NO_PGIO)
     if (Flags & FspFileNodeAcquirePgio)
         ExAcquireResourceExclusiveLite(FileNode->Header.PagingIoResource, TRUE);
+#endif
 
     FSP_FILE_NODE_SET_FLAGS();
 }
@@ -487,6 +495,7 @@ BOOLEAN FspFileNodeTryAcquireExclusiveF(FSP_FILE_NODE *FileNode, ULONG Flags, BO
             return FALSE;
     }
 
+#if !defined(FSP_FILE_NODE_NO_PGIO)
     if (Flags & FspFileNodeAcquirePgio)
     {
         Result = ExAcquireResourceExclusiveLite(FileNode->Header.PagingIoResource, Wait);
@@ -497,6 +506,7 @@ BOOLEAN FspFileNodeTryAcquireExclusiveF(FSP_FILE_NODE *FileNode, ULONG Flags, BO
             return FALSE;
         }
     }
+#endif
 
     if (Result)
         FSP_FILE_NODE_SET_FLAGS();
@@ -513,8 +523,10 @@ VOID FspFileNodeConvertExclusiveToSharedF(FSP_FILE_NODE *FileNode, ULONG Flags)
 
     FSP_FILE_NODE_GET_FLAGS();
 
+#if !defined(FSP_FILE_NODE_NO_PGIO)
     if (Flags & FspFileNodeAcquirePgio)
         ExConvertExclusiveToSharedLite(FileNode->Header.PagingIoResource);
+#endif
 
     if (Flags & FspFileNodeAcquireMain)
         ExConvertExclusiveToSharedLite(FileNode->Header.Resource);
@@ -534,8 +546,10 @@ VOID FspFileNodeSetOwnerF(FSP_FILE_NODE *FileNode, ULONG Flags, PVOID Owner)
     if (Flags & FspFileNodeAcquireMain)
         ExSetResourceOwnerPointer(FileNode->Header.Resource, Owner);
 
+#if !defined(FSP_FILE_NODE_NO_PGIO)
     if (Flags & FspFileNodeAcquirePgio)
         ExSetResourceOwnerPointer(FileNode->Header.PagingIoResource, Owner);
+#endif
 }
 
 VOID FspFileNodeReleaseF(FSP_FILE_NODE *FileNode, ULONG Flags)
@@ -548,8 +562,10 @@ VOID FspFileNodeReleaseF(FSP_FILE_NODE *FileNode, ULONG Flags)
     FSP_FILE_NODE_GET_FLAGS();
     FSP_FILE_NODE_ASSERT_FLAGS_SET();
 
+#if !defined(FSP_FILE_NODE_NO_PGIO)
     if (Flags & FspFileNodeAcquirePgio)
         ExReleaseResourceLite(FileNode->Header.PagingIoResource);
+#endif
 
     if (Flags & FspFileNodeAcquireMain)
         ExReleaseResourceLite(FileNode->Header.Resource);
@@ -569,6 +585,7 @@ VOID FspFileNodeReleaseOwnerF(FSP_FILE_NODE *FileNode, ULONG Flags, PVOID Owner)
 
     Owner = (PVOID)((UINT_PTR)Owner | 3);
 
+#if !defined(FSP_FILE_NODE_NO_PGIO)
     if (Flags & FspFileNodeAcquirePgio)
     {
         if (ExIsResourceAcquiredLite(FileNode->Header.PagingIoResource))
@@ -576,6 +593,7 @@ VOID FspFileNodeReleaseOwnerF(FSP_FILE_NODE *FileNode, ULONG Flags, PVOID Owner)
         else
             ExReleaseResourceForThreadLite(FileNode->Header.PagingIoResource, (ERESOURCE_THREAD)Owner);
     }
+#endif
 
     if (Flags & FspFileNodeAcquireMain)
     {
@@ -618,8 +636,7 @@ NTSTATUS FspFileNodeOpen(FSP_FILE_NODE *FileNode, PFILE_OBJECT FileObject,
      */
     if (0 != FileNode->MainFileNode)
     {
-        DeletePending = 0 != FileNode->MainFileNode->DeletePending;
-        MemoryBarrier();
+        DeletePending = FspFileNodeDeletePending(FileNode->MainFileNode);
         if (DeletePending)
         {
             Result = STATUS_DELETE_PENDING;
@@ -669,8 +686,7 @@ NTSTATUS FspFileNodeOpen(FSP_FILE_NODE *FileNode, PFILE_OBJECT FileObject,
         ASSERT(OpenedFileNode != FileNode);
         ASSERT(OpenedFileNode->MainFileNode == FileNode->MainFileNode);
 
-        DeletePending = 0 != OpenedFileNode->DeletePending;
-        MemoryBarrier();
+        DeletePending = FspFileNodeDeletePending(OpenedFileNode);
         if (DeletePending)
         {
             Result = STATUS_DELETE_PENDING;
@@ -795,9 +811,8 @@ VOID FspFileNodeCleanup(FSP_FILE_NODE *FileNode, PFILE_OBJECT FileObject, PULONG
     FspFsvolDeviceLockContextTable(FsvolDeviceObject);
 
     if (FileDesc->DeleteOnClose)
-        FileNode->DeletePending = TRUE;
-    DeletePending = 0 != FileNode->DeletePending;
-    MemoryBarrier();
+        FspFileNodeSetDeletePending(FileNode, TRUE);
+    DeletePending = FspFileNodeDeletePending(FileNode);
 
     SetAllocationSize = !DeletePending && FileNode->TruncateOnClose;
 
@@ -841,8 +856,7 @@ VOID FspFileNodeCleanupFlush(FSP_FILE_NODE *FileNode, PFILE_OBJECT FileObject)
 
     FspFsvolDeviceLockContextTable(FsvolDeviceObject);
 
-    DeletePending = 0 != FileNode->DeletePending;
-    MemoryBarrier();
+    DeletePending = FspFileNodeDeletePending(FileNode);
 
     SingleHandle = 1 == FileNode->HandleCount;
 
@@ -965,8 +979,7 @@ VOID FspFileNodeCleanupComplete(FSP_FILE_NODE *FileNode, PFILE_OBJECT FileObject
     {
         SingleHandle = TRUE;
 
-        DeletePending = 0 != FileNode->DeletePending;
-        MemoryBarrier();
+        DeletePending = FspFileNodeDeletePending(FileNode);
 
         if (DeletePending)
             FileNode->Header.FileSize.QuadPart = 0;
@@ -1179,7 +1192,7 @@ VOID FspFileNodeOverwriteStreams(FSP_FILE_NODE *FileNode)
         DescendantFileNodeIndex++)
     {
         DescendantFileNode = DescendantFileNodes[DescendantFileNodeIndex];
-        DescendantFileNode->DeletePending = TRUE;
+        FspFileNodeSetDeletePending(DescendantFileNode, TRUE);
     }
 
     FspFsvolDeviceUnlockContextTable(FsvolDeviceObject);
@@ -1464,7 +1477,7 @@ NTSTATUS FspFileNodeRenameCheck(PDEVICE_OBJECT FsvolDeviceObject, PIRP OplockIrp
             {
                 Result = NT_SUCCESS(Result) ? STATUS_OPLOCK_BREAK_IN_PROGRESS : Result;
                 DescendantFileNodes[DescendantFileNodeIndex] =
-                    (PVOID)((UINT_PTR)DescendantFileNode | 2);
+                    (PVOID)((UINT_PTR)DescendantFileNode | 4);
             }
             else
                 Result = STATUS_ACCESS_DENIED;
@@ -2792,12 +2805,40 @@ NTSTATUS FspMainFileClose(
 
     if (0 != MainFileHandle)
     {
-        Result = ObCloseHandle(MainFileHandle, KernelMode);
-        if (!NT_SUCCESS(Result))
-            DEBUGLOG("ObCloseHandle() = %s", NtStatusSym(Result));
+        FSP_SYNCHRONOUS_WORK_ITEM *WorkItem;
+
+        WorkItem = DEBUGTEST(90) ?
+            FspAllocateSynchronousWorkItem(FspMainFileCloseSynchronousWork, MainFileHandle) :
+            0;
+        if (0 != WorkItem)
+            /*
+             * Fix issue #680:
+             * Instead of closing the main file handle in this thread, close it in a system thread
+             * and wait for that close to complete in an alertable manner. This avoids a deadlock
+             * due to the file system process being forcibly terminated via NtTerminateProcess.
+             */
+            Result = FspExecuteSynchronousWorkItem(WorkItem, TRUE);
+        else
+            /*
+             * Best effort: Close the main file handle in this thread.
+             * Small chance of deadlock if someone is killing our file system.
+             */
+            FspMainFileCloseSynchronousWork(MainFileHandle);
     }
 
     return Result;
+}
+
+static VOID FspMainFileCloseSynchronousWork(PVOID Context)
+{
+    PAGED_CODE();
+
+    HANDLE MainFileHandle = Context;
+    NTSTATUS Result;
+
+    Result = ObCloseHandle(MainFileHandle, KernelMode);
+    if (!NT_SUCCESS(Result))
+        DEBUGLOG("ObCloseHandle() = %s", NtStatusSym(Result));
 }
 
 VOID FspFileNodeOplockPrepare(PVOID Context, PIRP Irp)

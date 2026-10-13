@@ -1,7 +1,7 @@
 /**
  * @file sys/volume.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -38,6 +38,8 @@ static NTSTATUS FspVolumeMountNoLock(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeMakeMountdev(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+NTSTATUS FspVolumeUseMountmgr(
+    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeGetName(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeGetNameList(
@@ -46,6 +48,15 @@ static NTSTATUS FspVolumeGetNameListNoLock(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeTransact(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+NTSTATUS FspVolumeFastTransact(
+    PDEVICE_OBJECT FsvolDeviceObject,
+    ULONG ControlCode,
+    PVOID InputBuffer,
+    ULONG InputBufferLength,
+    PVOID OutputBuffer,
+    ULONG OutputBufferLength,
+    PIO_STATUS_BLOCK IoStatus,
+    PIRP Irp);
 NTSTATUS FspVolumeTransactFsext(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeStop(
@@ -67,10 +78,12 @@ NTSTATUS FspVolumeWork(
 // ! #pragma alloc_text(PAGE, FspVolumeMount)
 // ! #pragma alloc_text(PAGE, FspVolumeMountNoLock)
 #pragma alloc_text(PAGE, FspVolumeMakeMountdev)
+#pragma alloc_text(PAGE, FspVolumeUseMountmgr)
 #pragma alloc_text(PAGE, FspVolumeGetName)
 #pragma alloc_text(PAGE, FspVolumeGetNameList)
 #pragma alloc_text(PAGE, FspVolumeGetNameListNoLock)
 #pragma alloc_text(PAGE, FspVolumeTransact)
+#pragma alloc_text(PAGE, FspVolumeFastTransact)
 #pragma alloc_text(PAGE, FspVolumeTransactFsext)
 #pragma alloc_text(PAGE, FspVolumeStop)
 #pragma alloc_text(PAGE, FspVolumeNotify)
@@ -99,6 +112,57 @@ NTSTATUS FspVolumeCreate(
     FspDeviceGlobalUnlock();
 
     FspSiloDereferenceGlobals(Globals);
+
+    if (NT_SUCCESS(Result))
+    {
+        /*
+         * If we have an fsvrt device, mount it NOW via opening the volume. This ensures
+         * that the fsvrt is mounted by the correct fsvol device early on and remedies
+         * a rare case where NTFS crashes the system when it attempts to mount our fsvrt.
+         *
+         * We use IoCreateFileEx with FILE_READ_DATA to ensure that the I/O Manager will
+         * mount the fsvrt device.
+         *
+         * We ignore the IoCreateFileEx return code as it is only used for its side effect
+         * of mounting the fsvrt. In the unlikely event that IoCreateFileEx fails, the
+         * system will retry the mount when a file is accessed, etc.
+         */
+
+        PDEVICE_OBJECT FsvolDeviceObject = IrpSp->FileObject->FsContext2;
+        FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
+        PDEVICE_OBJECT FsvrtDeviceObject = FsvolDeviceExtension->FsvrtDeviceObject;
+        OBJECT_ATTRIBUTES ObjectAttributes;
+        IO_STATUS_BLOCK IoStatus;
+        HANDLE Handle;
+
+        if (0 != FsvrtDeviceObject)
+        {
+            InitializeObjectAttributes(
+                &ObjectAttributes,
+                &FsvolDeviceExtension->VolumeName,
+                OBJ_KERNEL_HANDLE,
+                0/*RootDirectory*/,
+                0/*SecurityDescriptor*/);
+            IoStatus.Status = IoCreateFileEx(
+                &Handle,
+                FILE_READ_DATA,
+                &ObjectAttributes,
+                &IoStatus,
+                0/*AllocationSize*/,
+                0/*FileAttributes*/,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                0/*CreateOptions*/,
+                0/*EaBuffer*/,
+                0/*EaLength*/,
+                CreateFileTypeNone,
+                0/*InternalParameters*/,
+                0/*Options*/,
+                0/*DriverContext*/);
+            if (NT_SUCCESS(IoStatus.Status))
+                ObCloseHandle(Handle, KernelMode);
+        }
+    }
 
     return Result;
 }
@@ -236,6 +300,11 @@ static NTSTATUS FspVolumeCreateNoLock(
     VolumeParams.AlwaysUseDoubleBuffering = 1;
 #endif
 
+    /*
+     * Hardcode the RejectIrpPriorToTransact0 = 1 setting.
+     */
+    VolumeParams.RejectIrpPriorToTransact0 = 1;
+
     /* load any fsext provider */
     if (0 != VolumeParams.FsextControlCode)
     {
@@ -306,8 +375,12 @@ static NTSTATUS FspVolumeCreateNoLock(
     {
         if (0 != FsvrtDeviceObject)
         {
-            FspFsvrtDeviceExtension(FsvrtDeviceObject)->SectorSize =
-                FsvolDeviceExtension->VolumeParams.SectorSize;
+            FSP_FSVRT_DEVICE_EXTENSION *FsvrtDeviceExtension = FspFsvrtDeviceExtension(FsvrtDeviceObject);
+            FsvrtDeviceExtension->SectorSize = FsvolDeviceExtension->VolumeParams.SectorSize;
+            RtlInitEmptyUnicodeString(&FsvrtDeviceExtension->VolumeName,
+                FsvrtDeviceExtension->VolumeNameBuf, sizeof FsvrtDeviceExtension->VolumeNameBuf);
+            RtlCopyUnicodeString(&FsvrtDeviceExtension->VolumeName, &FsvolDeviceExtension->VolumeName);
+
             Result = FspDeviceInitialize(FsvrtDeviceObject);
         }
     }
@@ -359,6 +432,12 @@ VOID FspVolumeDelete(
     ULONG FileNodeCount, Index;
     NTSTATUS Result;
 
+    /* stop the I/O queue */
+    FspIoqStop(FsvolDeviceExtension->Ioq, TRUE);
+
+    FspFsvolDeviceVolumeDeleteAcquireExclusive(FsvolDeviceObject);
+    FsvolDeviceExtension->VolumeDeleted = TRUE;
+
     /*
      * If we have an fsvrt that is a mountdev, finalize it now! Finalizing a mountdev
      * involves interaction with the MountManager, which tries to open our devices.
@@ -393,6 +472,8 @@ VOID FspVolumeDelete(
         FspFileNodeDeleteList(FileNodes, FileNodeCount);
     }
 
+    FspFsvolDeviceVolumeDeleteRelease(FsvolDeviceObject);
+
     FspDeviceDereference(FsvolDeviceObject);
 }
 
@@ -407,10 +488,6 @@ static VOID FspVolumeDeleteNoLock(
 
     PDEVICE_OBJECT FsvolDeviceObject = IrpSp->FileObject->FsContext2;
     FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
-    IrpSp->FileObject->FsContext2 = 0;
-
-    /* stop the I/O queue */
-    FspIoqStop(FsvolDeviceExtension->Ioq, TRUE);
 
     /* do we have a virtual disk device or are we registered with fsmup? */
     if (0 != FsvolDeviceExtension->FsvrtDeviceObject)
@@ -476,10 +553,12 @@ static VOID FspVolumeDeleteNoLock(
         FspMupUnregister(Globals->FsmupDeviceObject, FsvolDeviceObject);
     }
 
-    /* release the volume notify lock if held (so that any pending rename will abort) */
-    FspWgroupSignalPermanently(&FsvolDeviceExtension->VolumeNotifyWgroup);
-    if (1 == InterlockedCompareExchange(&FsvolDeviceExtension->VolumeNotifyLock, 0, 1))
-        FspFsvolDeviceFileRenameReleaseOwner(FsvolDeviceObject, FsvolDeviceObject);
+    FspFsvolDeviceLockVolumeNotify(FsvolDeviceObject);
+    if (1 <= FsvolDeviceExtension->VolumeNotifyCount)
+        FspFsvolDeviceFileRenameReleaseOwner(FsvolDeviceObject,
+            &FsvolDeviceExtension->VolumeNotifyCount);
+    FsvolDeviceExtension->VolumeNotifyCount = -1;
+    FspFsvolDeviceUnlockVolumeNotify(FsvolDeviceObject);
 
     /* release the volume device object */
     FspDeviceDereference(FsvolDeviceObject);
@@ -622,7 +701,7 @@ NTSTATUS FspVolumeMakeMountdev(
     if (sizeof(GUID) > OutputBufferLength)
         return STATUS_INVALID_PARAMETER;
 
-    FspDeviceGlobalLock();
+    FspFsvrtDeviceLockMount(FsvrtDeviceObject);
 
     Result = FspMountdevMake(FsvrtDeviceObject, FsvolDeviceObject, Persistent);
     if (!NT_SUCCESS(Result))
@@ -638,7 +717,147 @@ NTSTATUS FspVolumeMakeMountdev(
     Result = STATUS_SUCCESS;
 
 exit:
-    FspDeviceGlobalUnlock();
+    FspFsvrtDeviceUnlockMount(FsvrtDeviceObject);
+
+    return Result;
+}
+
+NTSTATUS FspVolumeUseMountmgr(
+    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
+{
+    PAGED_CODE();
+
+    ASSERT(IRP_MJ_FILE_SYSTEM_CONTROL == IrpSp->MajorFunction);
+    ASSERT(IRP_MN_USER_FS_REQUEST == IrpSp->MinorFunction);
+    ASSERT(FSP_FSCTL_MOUNTMGR == IrpSp->Parameters.FileSystemControl.FsControlCode);
+    ASSERT(0 != IrpSp->FileObject->FsContext2);
+
+    PDEVICE_OBJECT FsvolDeviceObject = IrpSp->FileObject->FsContext2;
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
+    PDEVICE_OBJECT FsvrtDeviceObject = FsvolDeviceExtension->FsvrtDeviceObject;
+    ULONG InputBufferLength = IrpSp->Parameters.FileSystemControl.InputBufferLength;
+    NTSTATUS Result;
+
+    if (0 == FsvrtDeviceObject)
+        return STATUS_INVALID_PARAMETER; /* cannot only use fsvrt with mount manager */
+    if (1024 * sizeof(WCHAR) < InputBufferLength)
+        return STATUS_INVALID_PARAMETER; /* disallow very long paths */
+
+    FspFsvrtDeviceLockMount(FsvrtDeviceObject);
+
+    if (0 < InputBufferLength)
+    {
+        FSP_FSVRT_DEVICE_EXTENSION *FsvrtDeviceExtension = FspFsvrtDeviceExtension(FsvrtDeviceObject);
+        PWCHAR MountPointBuf = Irp->AssociatedIrp.SystemBuffer;
+        UNICODE_STRING RegPath;
+        UNICODE_STRING RegName;
+        union
+        {
+            KEY_VALUE_PARTIAL_INFORMATION V;
+            UINT8 B[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + sizeof(ULONG)];
+        } RegValue;
+        ULONG RegLength;
+        BOOLEAN Persistent = FALSE;
+
+        if (!(
+            2 * sizeof(WCHAR) <= InputBufferLength &&
+            (
+                (L'A' <= MountPointBuf[0] && MountPointBuf[0] <= L'Z') ||
+                (L'a' <= MountPointBuf[0] && MountPointBuf[0] <= L'z')
+            ) &&
+            L':' == MountPointBuf[1]
+            ))
+        {
+            Result = STATUS_INVALID_PARAMETER;
+            goto exit;
+        }
+
+        if (0 != FsvrtDeviceExtension->MountPoint.Buffer)
+        {
+            Result = STATUS_INVALID_PARAMETER;
+            goto exit;
+        }
+
+        RtlInitUnicodeString(&RegPath, L"" FSP_REGKEY);
+        RtlInitUnicodeString(&RegName, L"MountUseMountmgrFromFSD");
+        RegLength = sizeof RegValue;
+        Result = FspRegistryGetValue(&RegPath, &RegName, &RegValue.V, &RegLength);
+        if (!NT_SUCCESS(Result) || REG_DWORD != RegValue.V.Type || 1 != *(PULONG)&RegValue.V.Data)
+        {
+            Result = STATUS_ACCESS_DENIED;
+            goto exit;
+        }
+
+        Result = FspMountdevMake(FsvrtDeviceObject, FsvolDeviceObject, Persistent);
+        if (!NT_SUCCESS(Result))
+        {
+            if (STATUS_TOO_LATE != Result)
+                goto exit;
+        }
+
+        FsvrtDeviceExtension->MountPoint.Buffer = FspAllocNonPaged(InputBufferLength);
+        if (0 == FsvrtDeviceExtension->MountPoint.Buffer)
+        {
+            Result = STATUS_INSUFFICIENT_RESOURCES;
+            goto exit;
+        }
+        FsvrtDeviceExtension->MountPoint.Length =
+            FsvrtDeviceExtension->MountPoint.MaximumLength = (USHORT)InputBufferLength;
+        RtlCopyMemory(FsvrtDeviceExtension->MountPoint.Buffer, MountPointBuf, InputBufferLength);
+
+        if (2 * sizeof(WCHAR) == FsvrtDeviceExtension->MountPoint.Length)
+            Result = FspMountmgrCreateDrive(
+                &FsvrtDeviceExtension->VolumeName,
+                &FsvrtDeviceExtension->UniqueId,
+                &FsvrtDeviceExtension->MountPoint);
+        else
+            Result = FspMountmgrNotifyCreateDirectory(
+                &FsvrtDeviceExtension->VolumeName,
+                &FsvrtDeviceExtension->UniqueId,
+                &FsvrtDeviceExtension->MountPoint);
+        if (!NT_SUCCESS(Result))
+        {
+            FspFree(FsvrtDeviceExtension->MountPoint.Buffer);
+            FsvrtDeviceExtension->MountPoint.Buffer = 0;
+            FsvrtDeviceExtension->MountPoint.Length =
+                FsvrtDeviceExtension->MountPoint.MaximumLength = 0;
+            goto exit;
+        }
+
+        Irp->IoStatus.Information = 0;
+        Result = STATUS_SUCCESS;
+
+    }
+    else
+    {
+        FSP_FSVRT_DEVICE_EXTENSION *FsvrtDeviceExtension = FspFsvrtDeviceExtension(FsvrtDeviceObject);
+
+        if (0 == FsvrtDeviceExtension->MountPoint.Buffer)
+        {
+            Result = STATUS_INVALID_PARAMETER;
+            goto exit;
+        }
+
+        if (2 * sizeof(WCHAR) == FsvrtDeviceExtension->MountPoint.Length)
+            Result = FspMountmgrDeleteDrive(
+                &FsvrtDeviceExtension->MountPoint);
+        else
+            Result = FspMountmgrNotifyDeleteDirectory(
+                &FsvrtDeviceExtension->VolumeName,
+                &FsvrtDeviceExtension->MountPoint);
+        /* ignore Result */
+
+        FspFree(FsvrtDeviceExtension->MountPoint.Buffer);
+        FsvrtDeviceExtension->MountPoint.Buffer = 0;
+        FsvrtDeviceExtension->MountPoint.Length =
+            FsvrtDeviceExtension->MountPoint.MaximumLength = 0;
+
+        Irp->IoStatus.Information = 0;
+        Result = STATUS_SUCCESS;
+    }
+
+exit:
+    FspFsvrtDeviceUnlockMount(FsvrtDeviceObject);
 
     return Result;
 }
@@ -762,22 +981,35 @@ NTSTATUS FspVolumeTransact(
 {
     PAGED_CODE();
 
-    ASSERT(IRP_MJ_FILE_SYSTEM_CONTROL == IrpSp->MajorFunction);
-    ASSERT(IRP_MN_USER_FS_REQUEST == IrpSp->MinorFunction);
     ASSERT(
-        FSP_FSCTL_TRANSACT == IrpSp->Parameters.FileSystemControl.FsControlCode ||
-        FSP_FSCTL_TRANSACT_BATCH == IrpSp->Parameters.FileSystemControl.FsControlCode ||
-        FSP_FSCTL_TRANSACT_INTERNAL == IrpSp->Parameters.FileSystemControl.FsControlCode);
+        (
+            IRP_MJ_FILE_SYSTEM_CONTROL == IrpSp->MajorFunction &&
+            IRP_MN_USER_FS_REQUEST == IrpSp->MinorFunction &&
+            (
+                FSP_FSCTL_TRANSACT == IrpSp->Parameters.FileSystemControl.FsControlCode ||
+                FSP_FSCTL_TRANSACT_BATCH == IrpSp->Parameters.FileSystemControl.FsControlCode ||
+                FSP_FSCTL_TRANSACT_INTERNAL == IrpSp->Parameters.FileSystemControl.FsControlCode
+            )
+        ) ||
+        (
+            IRP_MJ_DEVICE_CONTROL == IrpSp->MajorFunction &&
+            (
+                FSP_IOCTL_TRANSACT == IrpSp->Parameters.FileSystemControl.FsControlCode ||
+                FSP_IOCTL_TRANSACT_BATCH == IrpSp->Parameters.FileSystemControl.FsControlCode ||
+                FSP_IOCTL_TRANSACT_INTERNAL == IrpSp->Parameters.FileSystemControl.FsControlCode
+            )
+        ));
     ASSERT(0 != IrpSp->FileObject->FsContext2);
 
     /* check parameters */
     PDEVICE_OBJECT FsvolDeviceObject = IrpSp->FileObject->FsContext2;
     ULONG ControlCode = IrpSp->Parameters.FileSystemControl.FsControlCode;
+    ULONG ControlFunction = FSP_FUNCTION_FROM_CTL_CODE(ControlCode);
     ULONG InputBufferLength = IrpSp->Parameters.FileSystemControl.InputBufferLength;
     ULONG OutputBufferLength = IrpSp->Parameters.FileSystemControl.OutputBufferLength;
     PVOID InputBuffer = 0;
     PVOID OutputBuffer = 0;
-    if (FSP_FSCTL_TRANSACT_INTERNAL == ControlCode)
+    if (FSP_FUNCTION_FROM_CTL_CODE(FSP_FSCTL_TRANSACT_INTERNAL) == ControlFunction)
     {
         InputBuffer = IrpSp->Parameters.FileSystemControl.Type3InputBuffer;
         if (KernelMode != Irp->RequestorMode)
@@ -794,12 +1026,35 @@ NTSTATUS FspVolumeTransact(
             FSP_FSCTL_DEFAULT_ALIGN_UP(sizeof(FSP_FSCTL_TRANSACT_RSP)) > InputBufferLength)
             return STATUS_INVALID_PARAMETER;
         if (0 != OutputBufferLength &&
-            ((FSP_FSCTL_TRANSACT == ControlCode &&
+            ((FSP_FUNCTION_FROM_CTL_CODE(FSP_FSCTL_TRANSACT) == ControlFunction &&
                 FSP_FSCTL_TRANSACT_BUFFER_SIZEMIN > OutputBufferLength) ||
-            (FSP_FSCTL_TRANSACT_BATCH == ControlCode &&
+            (FSP_FUNCTION_FROM_CTL_CODE(FSP_FSCTL_TRANSACT_BATCH) == ControlFunction &&
                 FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN > OutputBufferLength)))
             return STATUS_BUFFER_TOO_SMALL;
     }
+
+    return FspVolumeFastTransact(
+        FsvolDeviceObject,
+        ControlCode,
+        InputBuffer,
+        InputBufferLength,
+        OutputBuffer,
+        OutputBufferLength,
+        &Irp->IoStatus,
+        Irp);
+}
+
+NTSTATUS FspVolumeFastTransact(
+    PDEVICE_OBJECT FsvolDeviceObject,
+    ULONG ControlCode,
+    PVOID InputBuffer,
+    ULONG InputBufferLength,
+    PVOID OutputBuffer,
+    ULONG OutputBufferLength,
+    PIO_STATUS_BLOCK IoStatus,
+    PIRP Irp)
+{
+    PAGED_CODE();
 
     if (!FspDeviceReference(FsvolDeviceObject))
         return STATUS_CANCELLED;
@@ -811,6 +1066,7 @@ NTSTATUS FspVolumeTransact(
 
     NTSTATUS Result;
     FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
+    ULONG ControlFunction = FSP_FUNCTION_FROM_CTL_CODE(ControlCode);
     PUINT8 BufferEnd;
     FSP_FSCTL_TRANSACT_RSP *Response, *NextResponse;
     FSP_FSCTL_TRANSACT_REQ *Request, *PendingIrpRequest;
@@ -880,27 +1136,30 @@ NTSTATUS FspVolumeTransact(
         }
     }
 
-    /* were we sent an output buffer? */
-    switch (ControlCode & 3)
+    if ((PIRP)FSRTL_MAX_TOP_LEVEL_IRP_FLAG < Irp)
     {
-    case METHOD_NEITHER:
-        OutputBuffer = Irp->UserBuffer;
-        break;
-    case METHOD_OUT_DIRECT:
-        if (0 != Irp->MdlAddress)
-            OutputBuffer = MmGetMdlVirtualAddress(Irp->MdlAddress);
-        break;
-    case METHOD_BUFFERED:
-        if (0 != OutputBufferLength)
-            OutputBuffer = Irp->AssociatedIrp.SystemBuffer;
-        break;
-    default:
-        ASSERT(0);
-        break;
+        /* were we sent an output buffer? */
+        switch (ControlCode & 3)
+        {
+        case METHOD_NEITHER:
+            OutputBuffer = Irp->UserBuffer;
+            break;
+        case METHOD_OUT_DIRECT:
+            if (0 != Irp->MdlAddress)
+                OutputBuffer = MmGetMdlVirtualAddress(Irp->MdlAddress);
+            break;
+        case METHOD_BUFFERED:
+            if (0 != OutputBufferLength)
+                OutputBuffer = Irp->AssociatedIrp.SystemBuffer;
+            break;
+        default:
+            ASSERT(0);
+            break;
+        }
     }
     if (0 == OutputBuffer)
     {
-        Irp->IoStatus.Information = 0;
+        IoStatus->Information = 0;
         Result = STATUS_SUCCESS;
         goto exit;
     }
@@ -921,7 +1180,7 @@ NTSTATUS FspVolumeTransact(
     }
     if (FspIoqTimeout == PendingIrp || FspIoqCancelled == PendingIrp)
     {
-        Irp->IoStatus.Information = 0;
+        IoStatus->Information = 0;
         Result = FspIoqTimeout == PendingIrp ? STATUS_SUCCESS : STATUS_CANCELLED;
         goto exit;
     }
@@ -930,7 +1189,7 @@ NTSTATUS FspVolumeTransact(
     RepostedIrp = 0;
     Request = OutputBuffer;
     BufferEnd = (PUINT8)OutputBuffer + OutputBufferLength;
-    ASSERT(FSP_FSCTL_TRANSACT_INTERNAL == ControlCode ?
+    ASSERT(FSP_FUNCTION_FROM_CTL_CODE(FSP_FSCTL_TRANSACT_INTERNAL) == ControlFunction ?
         TRUE :
         FspFsctlTransactCanProduceRequest(Request, BufferEnd));
     LoopCount = FspIoqPendingIrpCount(FsvolDeviceExtension->Ioq);
@@ -953,7 +1212,7 @@ NTSTATUS FspVolumeTransact(
             FspIopCompleteIrp(PendingIrp, Result);
         else
         {
-            if (FSP_FSCTL_TRANSACT_INTERNAL == ControlCode)
+            if (FSP_FUNCTION_FROM_CTL_CODE(FSP_FSCTL_TRANSACT_INTERNAL) == ControlFunction)
             {
                 InternalBuffer = FspAllocatePoolMustSucceed(
                     PagedPool, PendingIrpRequest->Size, FSP_ALLOC_EXTERNAL_TAG);
@@ -977,7 +1236,7 @@ NTSTATUS FspVolumeTransact(
                 ASSERT(FspIoqStopped(FsvolDeviceExtension->Ioq));
                 if (0 != InternalBuffer)
                 {
-                    ASSERT(FSP_FSCTL_TRANSACT_INTERNAL == ControlCode);
+                    ASSERT(FSP_FUNCTION_FROM_CTL_CODE(FSP_FSCTL_TRANSACT_INTERNAL) == ControlFunction);
                     *(PVOID *)OutputBuffer = 0;
                     FspFree(InternalBuffer);
                 }
@@ -987,14 +1246,14 @@ NTSTATUS FspVolumeTransact(
             }
 
             /* are we doing single request or batch mode? */
-            if (FSP_FSCTL_TRANSACT_INTERNAL == ControlCode)
+            if (FSP_FUNCTION_FROM_CTL_CODE(FSP_FSCTL_TRANSACT_INTERNAL) == ControlFunction)
             {
-                Irp->IoStatus.Information = sizeof(PVOID);
+                IoStatus->Information = sizeof(PVOID);
                 Result = STATUS_SUCCESS;
                 goto exit;
             }
             else
-            if (FSP_FSCTL_TRANSACT == ControlCode)
+            if (FSP_FUNCTION_FROM_CTL_CODE(FSP_FSCTL_TRANSACT) == ControlFunction)
                 break;
 
             /* check that we have enough space before pulling the next pending IRP off the queue */
@@ -1011,7 +1270,7 @@ NTSTATUS FspVolumeTransact(
             break;
     }
 
-    Irp->IoStatus.Information = (PUINT8)Request - (PUINT8)OutputBuffer;
+    IoStatus->Information = (PUINT8)Request - (PUINT8)OutputBuffer;
     Result = STATUS_SUCCESS;
 
 exit:
@@ -1131,8 +1390,19 @@ NTSTATUS FspVolumeNotify(
     if (0 == InputBufferLength)
         return FspVolumeNotifyLock(FsvolDeviceObject);
 
+    if (FSP_FSCTL_NOTIFY_INFO_SIZEMAX < InputBufferLength)
+        return STATUS_INVALID_PARAMETER;
+
     if (!FspDeviceReference(FsvolDeviceObject))
         return STATUS_CANCELLED;
+
+    FspFsvolDeviceVolumeDeleteAcquireShared(FsvolDeviceObject);
+    if (FsvolDeviceExtension->VolumeDeleted ||
+        FspIoqStopped(FsvolDeviceExtension->Ioq))
+    {
+        Result = STATUS_CANCELLED;
+        goto fail;
+    }
 
     NotifyWorkItem = FspAllocNonPaged(
         FIELD_OFFSET(FSP_VOLUME_NOTIFY_WORK_ITEM, InputBuffer) + InputBufferLength);
@@ -1155,10 +1425,11 @@ NTSTATUS FspVolumeNotify(
         goto fail;
     }
 
+    FspFsvolDeviceVolumeDeleteSetOwner(FsvolDeviceObject, NotifyWorkItem);
+
     ExInitializeWorkItem(&NotifyWorkItem->WorkItem, FspVolumeNotifyWork, NotifyWorkItem);
     NotifyWorkItem->FsvolDeviceObject = FsvolDeviceObject;
 
-    FspWgroupIncrement(&FsvolDeviceExtension->VolumeNotifyWgroup);
     ExQueueWorkItem(&NotifyWorkItem->WorkItem, DelayedWorkQueue);
 
     return STATUS_SUCCESS;
@@ -1166,6 +1437,8 @@ NTSTATUS FspVolumeNotify(
 fail:
     if (0 != NotifyWorkItem)
         FspFree(NotifyWorkItem);
+
+    FspFsvolDeviceVolumeDeleteRelease(FsvolDeviceObject);
 
     FspDeviceDereference(FsvolDeviceObject);
 
@@ -1177,11 +1450,6 @@ static NTSTATUS FspVolumeNotifyLock(
 {
     PAGED_CODE();
 
-    NTSTATUS Result;
-
-    if (!FspDeviceReference(FsvolDeviceObject))
-        return STATUS_CANCELLED;
-
     /*
      * Acquire the rename lock shared to disallow concurrent RENAME's.
      *
@@ -1190,19 +1458,28 @@ static NTSTATUS FspVolumeNotifyLock(
      * that the file is not open and not invalidate its caches, whereas the
      * file has simply changed name.
      */
-    Result = STATUS_CANT_WAIT;
-    if (FspFsvolDeviceFileRenameTryAcquireShared(FsvolDeviceObject))
-    {
-        FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
 
-        if (0 == InterlockedCompareExchange(&FsvolDeviceExtension->VolumeNotifyLock, 1, 0))
+    if (!FspDeviceReference(FsvolDeviceObject))
+        return STATUS_CANCELLED;
+
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
+    NTSTATUS Result = STATUS_SUCCESS;
+
+    FspFsvolDeviceLockVolumeNotify(FsvolDeviceObject);
+    if (0 == FsvolDeviceExtension->VolumeNotifyCount)
+    {
+        if (FspFsvolDeviceFileRenameTryAcquireShared(FsvolDeviceObject))
         {
-            FspFsvolDeviceFileRenameSetOwner(FsvolDeviceObject, FsvolDeviceObject);
-            Result = STATUS_SUCCESS;
+            FspFsvolDeviceFileRenameSetOwner(FsvolDeviceObject,
+                &FsvolDeviceExtension->VolumeNotifyCount);
+            FsvolDeviceExtension->VolumeNotifyCount++;
         }
         else
-            FspFsvolDeviceFileRenameRelease(FsvolDeviceObject);
+            Result = STATUS_CANT_WAIT;
     }
+    else if (0 < FsvolDeviceExtension->VolumeNotifyCount)
+        FsvolDeviceExtension->VolumeNotifyCount++;
+    FspFsvolDeviceUnlockVolumeNotify(FsvolDeviceObject);
 
     FspDeviceDereference(FsvolDeviceObject);
 
@@ -1227,6 +1504,16 @@ static VOID FspVolumeNotifyWork(PVOID NotifyWorkItem0)
     BOOLEAN Unlock = FALSE;
     NTSTATUS Result;
 
+    /*
+     * Starve queued exclusive (rename) waiters here to avoid a self-deadlock:
+     * the enclosing FspFileSystemNotifyBegin/End session already holds this
+     * resource shared, and a rename that queues exclusive mid-session would
+     * otherwise block this work item -- the same work item that must release
+     * the session (FspVolumeNotifyLock count) and unblock that rename. See
+     * FspFsvolDeviceFileRenameAcquireSharedStarveExclusive.
+     */
+    FspFsvolDeviceFileRenameAcquireSharedStarveExclusive(FsvolDeviceObject);
+
     /* iterate over notify information and invalidate/notify each file */
     for (; (PUINT8)NotifyInfo + sizeof(NotifyInfo->Size) <= NotifyInfoEnd;
         NotifyInfo = (PVOID)((PUINT8)NotifyInfo + FSP_FSCTL_DEFAULT_ALIGN_UP(NotifyInfoSize)))
@@ -1238,6 +1525,8 @@ static VOID FspVolumeNotifyWork(PVOID NotifyWorkItem0)
             Unlock = TRUE;
             break;
         }
+        if ((SIZE_T)(NotifyInfoEnd - (PUINT8)NotifyInfo) < NotifyInfoSize)
+            break;
 
         FileName.Length =
         FileName.MaximumLength = (USHORT)(NotifyInfoSize - sizeof(FSP_FSCTL_NOTIFY_INFO));
@@ -1289,18 +1578,28 @@ static VOID FspVolumeNotifyWork(PVOID NotifyWorkItem0)
         }
     }
 
+    FspFsvolDeviceFileRenameRelease(FsvolDeviceObject);
+
     if (0 != FullFileName.Buffer)
         FspFree(FullFileName.Buffer);
 
     FspFree(NotifyWorkItem);
-
-    FspWgroupDecrement(&FsvolDeviceExtension->VolumeNotifyWgroup);
+    
     if (Unlock)
     {
-        FspWgroupWait(&FsvolDeviceExtension->VolumeNotifyWgroup, KernelMode, FALSE, 0);
-        if (1 == InterlockedCompareExchange(&FsvolDeviceExtension->VolumeNotifyLock, 0, 1))
-            FspFsvolDeviceFileRenameReleaseOwner(FsvolDeviceObject, FsvolDeviceObject);
+        FspFsvolDeviceLockVolumeNotify(FsvolDeviceObject);
+        if (1 == FsvolDeviceExtension->VolumeNotifyCount)
+        {
+            FspFsvolDeviceFileRenameReleaseOwner(FsvolDeviceObject,
+                &FsvolDeviceExtension->VolumeNotifyCount);
+            FsvolDeviceExtension->VolumeNotifyCount--;
+        }
+        else if (1 < FsvolDeviceExtension->VolumeNotifyCount)
+            FsvolDeviceExtension->VolumeNotifyCount--;
+        FspFsvolDeviceUnlockVolumeNotify(FsvolDeviceObject);
     }
+
+    FspFsvolDeviceVolumeDeleteReleaseOwner(FsvolDeviceObject, NotifyWorkItem);
 
     FspDeviceDereference(FsvolDeviceObject);
 

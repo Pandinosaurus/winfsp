@@ -2,7 +2,7 @@
  * @file sys/callbacks.c
  * Fast I/O and resource acquisition callbacks.
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -66,11 +66,17 @@ BOOLEAN FspFastIoCheckIfPossible(
     PIO_STATUS_BLOCK IoStatus,
     PDEVICE_OBJECT DeviceObject)
 {
+#if 1
+    ASSERT(FALSE);
+    return FALSE;
+
+#else
     FSP_ENTER_BOOL(PAGED_CODE());
 
     Result = FALSE;
 
     FSP_LEAVE_BOOL("FileObject=%p", FileObject);
+#endif
 }
 
 VOID FspAcquireFileForNtCreateSection(
@@ -148,8 +154,16 @@ NTSTATUS FspReleaseForModWrite(
 
     FSP_FILE_NODE *FileNode = FileObject->FsContext;
 
+    /*
+     * In some rare cases and under load the mapped page writer's TopLevelIrp
+     * may be trashed by some outside component (observed on Windows 10 1909).
+     */
+    PIRP TopLevelIrp = IoGetTopLevelIrp();
+    IoSetTopLevelIrp((PIRP)FSRTL_MOD_WRITE_TOP_LEVEL_IRP);
+
     FspFileNodeRelease(FileNode, Full);
-    ASSERT((PIRP)FSRTL_MOD_WRITE_TOP_LEVEL_IRP == IoGetTopLevelIrp());
+
+    IoSetTopLevelIrp(TopLevelIrp);
 
     FSP_LEAVE("FileObject=%p", FileObject);
 }
@@ -299,11 +313,20 @@ VOID FspPropagateTopFlags(PIRP Irp, PIRP TopLevelIrp)
 
     if ((PIRP)FSRTL_MAX_TOP_LEVEL_IRP_FLAG >= TopLevelIrp)
     {
+        /*
+         * FAST I/O only acquires the Main lock.
+         * Other (non-IRP) top levels acquire the Full lock.
+         */
         DEBUGBREAK_EX(iorecu);
 
-        FspIrpSetTopFlags(Irp, FspFileNodeAcquireFull);
+        FspIrpSetTopFlags(Irp,
+            (PIRP)FSRTL_FAST_IO_TOP_LEVEL_IRP == TopLevelIrp ?
+            FspFileNodeAcquireMain :
+            FspFileNodeAcquireFull);
     }
-    else if ((PIRP)MM_SYSTEM_RANGE_START <= TopLevelIrp && IO_TYPE_IRP == TopLevelIrp->Type)
+    else if ((PIRP)MM_SYSTEM_RANGE_START <= TopLevelIrp &&
+        IO_TYPE_IRP == TopLevelIrp->Type &&
+        TopLevelIrp->CurrentLocation <= TopLevelIrp->StackCount)
     {
         PFILE_OBJECT FileObject = IoGetCurrentIrpStackLocation(Irp)->FileObject;
         PFILE_OBJECT TopLevelFileObject = IoGetCurrentIrpStackLocation(TopLevelIrp)->FileObject;

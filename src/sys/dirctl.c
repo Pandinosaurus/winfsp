@@ -1,7 +1,7 @@
 /**
  * @file sys/dirctl.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -179,7 +179,8 @@ static NTSTATUS FspFsvolQueryDirectoryCopy(
         {
             DirInfoSize = DirInfo->Size;
 
-            if (sizeof(FSP_FSCTL_DIR_INFO) > DirInfoSize)
+            if (sizeof(FSP_FSCTL_DIR_INFO) > DirInfoSize ||
+                (SIZE_T)(DirInfoEnd - (PUINT8)DirInfo) < DirInfoSize)
             {
                 if (0 == *PDestLen)
                     return STATUS_NO_MORE_FILES;
@@ -205,6 +206,7 @@ static NTSTATUS FspFsvolQueryDirectoryCopy(
                     ASSERT(sizeof(UINT64) == DirectoryMarker->Length);
                     DirectoryMarkerFound = DirectoryNextOffset == *(PUINT64)DirectoryMarker->Buffer;
                 }
+                continue;
             }
 
             /* CopyLength is the same as FileName.Length except on STATUS_BUFFER_OVERFLOW */
@@ -753,8 +755,7 @@ static NTSTATUS FspFsvolNotifyChangeDirectory(
         return STATUS_ACCESS_DENIED;
 
     /* stop now if the directory is pending deletion */
-    DeletePending = 0 != FileNode->DeletePending;
-    MemoryBarrier();
+    DeletePending = FspFileNodeDeletePending(FileNode);
     if (DeletePending)
         return STATUS_DELETE_PENDING;
 
@@ -865,6 +866,8 @@ NTSTATUS FspFsvolDirectoryControlPrepare(
     PVOID Cookie;
     PVOID Address;
     PEPROCESS Process;
+
+    ASSERT(FspProcessBufferSizeMax >= Request->Req.QueryDirectory.Length);
 
     Result = FspProcessBufferAcquire(Request->Req.QueryDirectory.Length, &Cookie, &Address);
     if (!NT_SUCCESS(Result))

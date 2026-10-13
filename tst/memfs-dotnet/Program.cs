@@ -1,7 +1,7 @@
 /**
  * @file Program.cs
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -282,6 +282,7 @@ namespace memfs
             Host.ReparsePointsAccessCheck = false;
             Host.NamedStreams = true;
             Host.PostCleanupWhenModifiedOnly = true;
+            Host.PostDispositionWhenNecessaryOnly = true;
             Host.PassQueryDirectoryFileName = true;
             Host.ExtendedAttributes = true;
             Host.WslFeatures = true;

@@ -1,7 +1,7 @@
 /**
  * @file launcher/launcher.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -504,18 +504,18 @@ static SVC_INSTANCE *SvcInstanceLookup(PWSTR ClassName, PWSTR InstanceName)
 
 static inline ULONG SvcInstanceArgumentLength(PWSTR Arg, PWSTR Pattern, BOOLEAN Quote)
 {
-    PWSTR PathTransform(PWSTR Dest, PWSTR Arg, PWSTR Pattern);
+    PWSTR PathTransform(PWSTR Dest, PWSTR Arg, PWSTR Pattern, BOOLEAN Quote);
 
-    return (Quote ? 2 : 0) + (ULONG)((UINT_PTR)PathTransform(0, Arg, Pattern) / sizeof(WCHAR));
+    return (Quote ? 2 : 0) + (ULONG)((UINT_PTR)PathTransform(0, Arg, Pattern, Quote) / sizeof(WCHAR));
 }
 
 static inline PWSTR SvcInstanceArgumentCopy(PWSTR Dest, PWSTR Arg, PWSTR Pattern, BOOLEAN Quote)
 {
-    PWSTR PathTransform(PWSTR Dest, PWSTR Arg, PWSTR Pattern);
+    PWSTR PathTransform(PWSTR Dest, PWSTR Arg, PWSTR Pattern, BOOLEAN Quote);
 
     if (Quote)
         *Dest++ = L'"';
-    Dest = PathTransform(Dest, Arg, Pattern);
+    Dest = PathTransform(Dest, Arg, Pattern, Quote);
     if (Quote)
         *Dest++ = L'"';
 

@@ -1,7 +1,7 @@
 /**
  * @file winposix.h
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -38,7 +38,7 @@ typedef struct _DIR DIR;
 struct dirent
 {
     struct fuse_stat d_stat;
-    char d_name[255];
+    char d_name[255 * 4];
 };
 
 char *realpath(const char *path, char *resolved);

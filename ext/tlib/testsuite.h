@@ -1,7 +1,7 @@
 /**
  * @file tlib/testsuite.h
  *
- * @copyright 2014-2021 Bill Zissimopoulos
+ * @copyright 2014-2026 Bill Zissimopoulos
  */
 
 #ifndef TLIB_TESTSUITE_H_INCLUDED
@@ -64,6 +64,23 @@
 void tlib_add_test_suite(const char *name, void (*fn)(void));
 void tlib_add_test(const char *name, void (*fn)(void));
 void tlib_add_test_opt(const char *name, void (*fn)(void));
+
+/**
+ * Register a test hook to be run before and after every test.
+ *
+ * Test hooks are functions with prototype
+ * <code>void testhook(const char *name, void (*fn)(void), int v)</code>.
+ * The parameter v specifies that a test is about to be executed (v is +1)
+ * or it was just executed (v is -1).
+ */
+#define TESTHOOK(fn)\
+    do\
+    {\
+        void fn(const char *name, void (*fn)(void), int v);\
+        tlib_add_hook(fn);\
+    } while (0)
+
+void tlib_add_hook(void (*fn)(const char *name, void (*fn)(void), int v));
 
 /**
  * Printf function.

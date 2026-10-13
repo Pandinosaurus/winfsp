@@ -1,7 +1,7 @@
 /**
  * @file fsptool/fsptool.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -62,10 +62,12 @@ static void usage(void)
         "\n"
         "commands:\n"
         "    lsvol                           list file system devices (volumes)\n"
-        //"    list                            list running file system processes\n"
-        //"    kill                            kill file system process\n"
         "    id [NAME|SID|UID]               print user id\n"
-        "    perm [PATH|SDDL|UID:GID:MODE]   print permissions\n",
+        "    perm [PATH|SDDL|UID:GID:MODE]   print permissions\n"
+        "    lsdrv                           list drivers\n"
+        "    load                            load driver\n"
+        "    unload                          unload driver (requires load driver priv)\n"
+        "    ver                             print version\n",
         PROGNAME);
 }
 
@@ -237,6 +239,29 @@ NTSTATUS FspToolGetSidFromName(PWSTR Name, PSID *PSid)
     return STATUS_SUCCESS;
 }
 
+static int ver(int argc, wchar_t **argv)
+{
+    if (1 != argc)
+        usage();
+
+    NTSTATUS Result;
+    UINT32 Version;
+    PWSTR SxsIdent;
+
+    Result = FspVersion(&Version);
+    if (!NT_SUCCESS(Result))
+        return FspWin32FromNtStatus(Result);
+
+    SxsIdent = FspSxsIdent();
+
+    if (L'\0' == SxsIdent[0])
+        info("%u.%u", Version >> 16, Version & 0xFFFF);
+    else
+        info("%u.%u (SxS=%S)", Version >> 16, Version & 0xFFFF, SxsIdent);
+
+    return 0;
+}
+
 static NTSTATUS lsvol_dev(PWSTR DeviceName)
 {
     NTSTATUS Result;
@@ -255,7 +280,7 @@ static NTSTATUS lsvol_dev(PWSTR DeviceName)
         if (L'\0' == *P)
         {
             Drive[0] = FspToolGetDriveLetter(&LogicalDrives, VolumeName);
-            info("%-4S%S", Drive[0] ? Drive : L"", VolumeName);
+            info("%-4S%S", Drive[0] ? Drive : L"-", VolumeName);
             VolumeName = P + 1;
         }
 
@@ -541,6 +566,52 @@ static int perm(int argc, wchar_t **argv)
     return FspWin32FromNtStatus(Result);
 }
 
+static VOID lsdrv_enumfn(PVOID Context, PWSTR ServiceName, BOOLEAN Running)
+{
+    info("%-4s%S", Running ? "R" : "-", ServiceName);
+}
+
+static int lsdrv(int argc, wchar_t **argv)
+{
+    if (1 != argc)
+        usage();
+
+    NTSTATUS Result;
+
+    Result = FspFsctlEnumServices(lsdrv_enumfn, 0);
+    if (!NT_SUCCESS(Result))
+        return FspWin32FromNtStatus(Result);
+
+    return 0;
+}
+
+static int load(int argc, wchar_t **argv)
+{
+    if (1 != argc)
+        usage();
+
+    NTSTATUS Result;
+
+    Result = FspFsctlStartService();
+    if (!NT_SUCCESS(Result))
+        return FspWin32FromNtStatus(Result);
+
+    return 0;
+}
+static int unload(int argc, wchar_t **argv)
+{
+    if (1 != argc)
+        usage();
+
+    NTSTATUS Result;
+
+    Result = FspFsctlStopService();
+    if (!NT_SUCCESS(Result))
+        return FspWin32FromNtStatus(Result);
+
+    return 0;
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     argc--;
@@ -549,6 +620,9 @@ int wmain(int argc, wchar_t **argv)
     if (0 == argc)
         usage();
 
+    if (0 == invariant_wcscmp(L"ver", argv[0]))
+        return ver(argc, argv);
+    else
     if (0 == invariant_wcscmp(L"lsvol", argv[0]))
         return lsvol(argc, argv);
     else
@@ -557,6 +631,15 @@ int wmain(int argc, wchar_t **argv)
     else
     if (0 == invariant_wcscmp(L"perm", argv[0]))
         return perm(argc, argv);
+    else
+    if (0 == invariant_wcscmp(L"lsdrv", argv[0]))
+        return lsdrv(argc, argv);
+    else
+    if (0 == invariant_wcscmp(L"load", argv[0]))
+        return load(argc, argv);
+    else
+    if (0 == invariant_wcscmp(L"unload", argv[0]))
+        return unload(argc, argv);
     else
         usage();
 

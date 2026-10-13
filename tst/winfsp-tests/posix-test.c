@@ -1,7 +1,7 @@
 /**
  * @file posix-test.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -27,6 +27,8 @@
 
 static void posix_map_sid_test(void)
 {
+#define TEST_UIDMAP_UID                 1000042
+#define TEST_UIDMAP_SID                 L"S-1-12-1-1111-2222-3333-4444"
     struct
     {
         PWSTR SidStr;
@@ -100,6 +102,7 @@ static void posix_map_sid_test(void)
         { L"S-1-16-16384", 0x64000 },
         { L"S-1-16-20480", 0x65000 },
         { L"S-1-16-28672", 0x67000 },
+        { TEST_UIDMAP_SID, TEST_UIDMAP_UID },
         { 0, 0 },
         { 0, 0 },
     };
@@ -111,6 +114,14 @@ static void posix_map_sid_test(void)
     DWORD InfoSize;
     PSID Sid0, Sid1;
     UINT32 Uid;
+
+    UINT32 UidMap_Uid[1] = { TEST_UIDMAP_UID };
+    PSID UidMap_Sid[1];
+    Success = ConvertStringSidToSidW(TEST_UIDMAP_SID, &UidMap_Sid[0]);
+    ASSERT(Success);
+    Result = FspPosixSetUidMap(UidMap_Uid, UidMap_Sid, 1);
+    ASSERT(NT_SUCCESS(Result));
+    LocalFree(UidMap_Sid[0]);
 
     Success = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &Token);
     ASSERT(Success);
@@ -147,7 +158,10 @@ static void posix_map_sid_test(void)
 
     CloseHandle(Token);
 
-    for (size_t i = 0; sizeof map / sizeof map[0] > i; i++)
+    size_t n = sizeof map / sizeof map[0];
+    if (RunningInContainer)
+        n -= 2; /* container: disable tests for "user manager\containeradministrator" */
+    for (size_t i = 0; n > i; i++)
     {
         Success = ConvertStringSidToSidW(map[i].SidStr, &Sid0);
         ASSERT(Success);
@@ -169,6 +183,12 @@ static void posix_map_sid_test(void)
 
     LocalFree(map[sizeof map / sizeof map[0] - 2].SidStr);
     LocalFree(map[sizeof map / sizeof map[0] - 1].SidStr);
+
+    Result = FspPosixSetUidMap(0, 0, 0);
+    ASSERT(NT_SUCCESS(Result));
+
+#undef TEST_UIDMAP_UID
+#undef TEST_UIDMAP_SID
 }
 
 static void posix_map_sd_test(void)

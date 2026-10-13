@@ -1,7 +1,7 @@
 /**
  * @file dll/fuse/fuse_loop.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -95,9 +95,9 @@ static NTSTATUS fsp_fuse_loop_start(struct fuse *f)
         context->private_data = f->data = f->ops.init(&conn);
         f->VolumeParams.ReadOnlyVolume = 0 != (conn.want & FSP_FUSE_CAP_READ_ONLY);
         f->VolumeParams.CaseSensitiveSearch = 0 == (conn.want & FSP_FUSE_CAP_CASE_INSENSITIVE);
-        if (!f->VolumeParams.CaseSensitiveSearch)
+        if (!f->VolumeParams.CaseSensitiveSearch && 0 == f->ops.getpath)
             /*
-             * Disable GetDirInfoByName when file system is case-insensitive.
+             * Disable GetDirInfoByName when file system is case-insensitive and getpath == 0.
              * The reason is that Windows always sends us queries with uppercase
              * file names in GetDirInfoByName and we have no way in FUSE to normalize
              * those file names when embedding them in FSP_FSCTL_DIR_INFO.
@@ -184,9 +184,19 @@ static NTSTATUS fsp_fuse_loop_start(struct fuse *f)
             f->has_slashdot = 0 == err && 0040000 == (stbuf.st_mode & 0170000);
         }
     }
+    if (0 == (f->conn_want & FSP_FUSE_CAP_DELETE_ACCESS) || 0 == f->ops.access)
+        f->VolumeParams.PostDispositionWhenNecessaryOnly = 1;
     if (0 != f->ops.listxattr && 0 != f->ops.getxattr &&
         0 != f->ops.setxattr && 0 != f->ops.removexattr)
-        f->VolumeParams.ExtendedAttributes = 1;
+    {
+        char buf[1024];
+        int err;
+
+        /* if this fails with ENOSYS, then no EA support */
+        err = f->ops.getxattr("/",
+            "non-existant-a11ec902d22f4ec49003af15282d3b00", buf, sizeof buf);
+        f->VolumeParams.ExtendedAttributes = -ENOSYS_(f->env) != err;
+    }
 
     /* the FSD does not currently limit these VolumeParams fields; do so here! */
     if (f->VolumeParams.SectorSize < FSP_FUSE_SECTORSIZE_MIN ||
@@ -194,7 +204,7 @@ static NTSTATUS fsp_fuse_loop_start(struct fuse *f)
         f->VolumeParams.SectorSize = FSP_FUSE_SECTORSIZE_MAX;
     if (f->VolumeParams.SectorsPerAllocationUnit == 0)
         f->VolumeParams.SectorsPerAllocationUnit = 1;
-    if (f->VolumeParams.MaxComponentLength > 255)
+    if (f->VolumeParams.MaxComponentLength == 0 || f->VolumeParams.MaxComponentLength > 255)
         f->VolumeParams.MaxComponentLength = 255;
 
     if (0 == f->VolumeParams.VolumeCreationTime)

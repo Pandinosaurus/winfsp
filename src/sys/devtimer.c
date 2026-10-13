@@ -1,7 +1,7 @@
 /**
  * @file sys/devtimer.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -55,6 +55,7 @@ NTSTATUS FspDeviceInitializeAllTimers(VOID)
 VOID FspDeviceFinalizeAllTimers(VOID)
 {
     KeCancelTimer(&FspDeviceTimer);
+    KeFlushQueuedDpcs();
 
 #if DBG
     KIRQL Irql;

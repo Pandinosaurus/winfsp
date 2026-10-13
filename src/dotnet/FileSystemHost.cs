@@ -1,7 +1,7 @@
 /*
  * dotnet/FileSystemHost.cs
  *
- * Copyright 2015-2021 Bill Zissimopoulos
+ * Copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -276,6 +276,11 @@ namespace Fsp
         {
             get { return 0 != (_VolumeParams.Flags & VolumeParams.PostCleanupWhenModifiedOnly); }
             set { _VolumeParams.Flags |= (value ? VolumeParams.PostCleanupWhenModifiedOnly : 0); }
+        }
+        public Boolean PostDispositionWhenNecessaryOnly
+        {
+            get { return 0 != (_VolumeParams.Flags & VolumeParams.PostDispositionWhenNecessaryOnly); }
+            set { _VolumeParams.Flags |= (value ? VolumeParams.PostDispositionWhenNecessaryOnly : 0); }
         }
         public Boolean PassQueryDirectoryPattern
         {
@@ -1421,6 +1426,21 @@ namespace Fsp
             }
         }
 
+        private static void DispatcherStopped(
+            IntPtr FileSystemPtr,
+            Boolean Normally)
+        {
+            FileSystemBase FileSystem = (FileSystemBase)Api.GetUserContext(FileSystemPtr);
+            try
+            {
+                FileSystem.DispatcherStopped(Normally);
+            }
+            catch (Exception ex)
+            {
+                ExceptionHandler(FileSystem, ex);
+            }
+        }
+
         static FileSystemHost()
         {
             _FileSystemInterface.GetVolumeInfo = GetVolumeInfo;
@@ -1451,6 +1471,7 @@ namespace Fsp
             _FileSystemInterface.SetDelete = SetDelete;
             _FileSystemInterface.GetEa = GetEa;
             _FileSystemInterface.SetEa = SetEa;
+            _FileSystemInterface.DispatcherStopped = DispatcherStopped;
 
             _FileSystemInterfacePtr = Marshal.AllocHGlobal(FileSystemInterface.Size);
             /* Marshal.AllocHGlobal does not zero memory; we must do it ourselves! */

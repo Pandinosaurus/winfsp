@@ -1,7 +1,7 @@
 /**
  * @file dll/fuse/fuse_intf.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -545,6 +545,39 @@ static NTSTATUS fsp_fuse_intf_GetFileInfoFunnel(FSP_FILE_SYSTEM *FileSystem,
     return STATUS_SUCCESS;
 }
 
+static VOID fsp_fuse_intf_AddWriteEaAccess(
+    PSECURITY_DESCRIPTOR SecurityDescriptor)
+{
+    BOOL DaclPresent, DaclDefaulted;
+    PACL Acl;
+    ACL_SIZE_INFORMATION AclSizeInfo;
+    PACE_HEADER Ace;
+    PACCESS_MASK AccessMask;
+
+    if (!GetSecurityDescriptorDacl(SecurityDescriptor, &DaclPresent, &Acl, &DaclDefaulted))
+        return;
+    if (0 == Acl)
+        return;
+    if (!GetAclInformation(Acl, &AclSizeInfo, sizeof AclSizeInfo, AclSizeInformation))
+        return;
+
+    for (DWORD I = 0; I < AclSizeInfo.AceCount; I++)
+    {
+        if (!GetAce(Acl, I, &Ace))
+            return;
+
+        if (Ace->AceType == ACCESS_ALLOWED_ACE_TYPE)
+            AccessMask = &((PACCESS_ALLOWED_ACE)Ace)->Mask;
+        else if (Ace->AceType == ACCESS_DENIED_ACE_TYPE)
+            AccessMask = &((PACCESS_DENIED_ACE)Ace)->Mask;
+        else
+            continue;
+
+        if (*AccessMask & FILE_WRITE_DATA)
+            *AccessMask |= FILE_WRITE_EA;
+    }
+}
+
 static NTSTATUS fsp_fuse_intf_GetSecurityEx(FSP_FILE_SYSTEM *FileSystem,
     const char *PosixPath, struct fuse_file_info *fi,
     PUINT32 PFileAttributes,
@@ -578,8 +611,12 @@ static NTSTATUS fsp_fuse_intf_GetSecurityEx(FSP_FILE_SYSTEM *FileSystem,
         }
 
         *PSecurityDescriptorSize = SecurityDescriptorSize;
-        if (0 != SecurityDescriptorBuf)
+        if (0 != SecurityDescriptorBuf) 
+        {
             memcpy(SecurityDescriptorBuf, SecurityDescriptor, SecurityDescriptorSize);
+            if (f->add_write_ea_access)
+                fsp_fuse_intf_AddWriteEaAccess(SecurityDescriptorBuf);
+        }
     }
 
     if (0 != PFileAttributes)
@@ -850,6 +887,29 @@ exit:
     return Result;
 }
 
+static VOID fsp_fuse_intf_GetOpenFileInfoPath(
+    struct fuse *f,
+    const char *PosixPath,
+    struct fuse_file_info *fi,
+    FSP_FSCTL_OPEN_FILE_INFO *OpenFileInfo)
+{
+    char PosixNormalizedName[FSP_FSCTL_TRANSACT_PATH_SIZEMAX / sizeof(WCHAR)];
+    PWSTR NormalizedName;
+    ULONG NormalizedNameSize;
+
+    if (0 == f->ops.getpath(PosixPath, PosixNormalizedName, sizeof PosixNormalizedName, fi) &&
+        NT_SUCCESS(FspPosixMapPosixToWindowsPath(PosixNormalizedName, &NormalizedName)))
+    {
+        NormalizedNameSize = lstrlenW(NormalizedName) * sizeof(WCHAR);
+        if (OpenFileInfo->NormalizedNameSize >= NormalizedNameSize)
+        {
+            OpenFileInfo->NormalizedNameSize = (UINT16)NormalizedNameSize;
+            memcpy(OpenFileInfo->NormalizedName, NormalizedName, NormalizedNameSize);
+        }
+        FspPosixDeletePath(NormalizedName);
+    }
+}
+
 static NTSTATUS fsp_fuse_intf_Create(FSP_FILE_SYSTEM *FileSystem,
     PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess,
     UINT32 FileAttributes, PSECURITY_DESCRIPTOR SecurityDescriptor, UINT64 AllocationSize,
@@ -1005,7 +1065,7 @@ static NTSTATUS fsp_fuse_intf_Create(FSP_FILE_SYSTEM *FileSystem,
         {
             Result = FspFileSystemEnumerateEa(FileSystem,
                 fsp_fuse_intf_SetEaEntry, contexthdr->PosixPath, ExtraBuffer, ExtraLength);
-            if (!NT_SUCCESS(Result))
+            if (!NT_SUCCESS(Result) && STATUS_INVALID_DEVICE_REQUEST != Result)
                 goto exit;
         }
         else
@@ -1015,19 +1075,19 @@ static NTSTATUS fsp_fuse_intf_Create(FSP_FILE_SYSTEM *FileSystem,
             goto exit;
         }
     }
-    /*
-     * Ignore fuse_file_info::direct_io, fuse_file_info::keep_cache.
-     * NOTE: Originally WinFsp dit not support disabling the cache manager
-     * for an individual file. This is now possible and we should revisit.
-     *
-     * Ignore fuse_file_info::nonseekable.
-     */
 
     Result = fsp_fuse_intf_GetFileInfoEx(FileSystem, contexthdr->PosixPath,
         FUSE_FILE_INFO(CreateOptions & FILE_DIRECTORY_FILE, &fi),
         &Uid, &Gid, &Mode, &FileInfoBuf);
     if (!NT_SUCCESS(Result))
         goto exit;
+
+    /*
+     * Ignore fuse_file_info::keep_cache.
+     * Ignore fuse_file_info::nonseekable.
+     */
+
+    FspFileSystemGetOperationContext()->Response->Rsp.Create.Opened.DisableCache = fi.direct_io;
 
     *PFileDesc = filedesc;
     memcpy(FileInfo, &FileInfoBuf, sizeof FileInfoBuf);
@@ -1039,6 +1099,10 @@ static NTSTATUS fsp_fuse_intf_Create(FSP_FILE_SYSTEM *FileSystem,
     filedesc->FileHandle = fi.fh;
     filedesc->DirBuffer = 0;
     contexthdr->PosixPath = 0;
+
+    if (!f->VolumeParams.CaseSensitiveSearch && 0 != f->ops.getpath)
+        fsp_fuse_intf_GetOpenFileInfoPath(f, filedesc->PosixPath, -1 != fi.fh ? &fi : 0,
+            FspFileSystemGetOpenFileInfo(FileInfo));
 
     Result = STATUS_SUCCESS;
 
@@ -1163,13 +1227,11 @@ static NTSTATUS fsp_fuse_intf_Open(FSP_FILE_SYSTEM *FileSystem,
         goto exit;
 
     /*
-     * Ignore fuse_file_info::direct_io, fuse_file_info::keep_cache
-     * WinFsp does not currently support disabling the cache manager
-     * for an individual file although it should not be hard to add
-     * if required.
-     *
+     * Ignore fuse_file_info::keep_cache.
      * Ignore fuse_file_info::nonseekable.
      */
+
+    FspFileSystemGetOperationContext()->Response->Rsp.Create.Opened.DisableCache = fi.direct_io;
 
     *PFileDesc = filedesc;
     memcpy(FileInfo, &FileInfoBuf, sizeof FileInfoBuf);
@@ -1181,6 +1243,10 @@ static NTSTATUS fsp_fuse_intf_Open(FSP_FILE_SYSTEM *FileSystem,
     filedesc->FileHandle = fi.fh;
     filedesc->DirBuffer = 0;
     contexthdr->PosixPath = 0;
+
+    if (!f->VolumeParams.CaseSensitiveSearch && 0 != f->ops.getpath)
+        fsp_fuse_intf_GetOpenFileInfoPath(f, filedesc->PosixPath, -1 != fi.fh ? &fi : 0,
+            FspFileSystemGetOpenFileInfo(FileInfo));
 
     Result = STATUS_SUCCESS;
 
@@ -1225,7 +1291,7 @@ static NTSTATUS fsp_fuse_intf_Overwrite(FSP_FILE_SYSTEM *FileSystem,
 
         Result = FspFileSystemEnumerateEa(FileSystem,
             fsp_fuse_intf_SetEaEntry, filedesc->PosixPath, Ea, EaLength);
-        if (!NT_SUCCESS(Result))
+        if (!NT_SUCCESS(Result) && STATUS_INVALID_DEVICE_REQUEST != Result)
             return Result;
     }
 
@@ -1274,6 +1340,7 @@ static VOID fsp_fuse_intf_Cleanup(FSP_FILE_SYSTEM *FileSystem,
 {
     struct fuse *f = FileSystem->UserContext;
     struct fsp_fuse_file_desc *filedesc = FileDesc;
+    struct fuse_file_info fi;
 
     /*
      * In Windows a DeleteFile/RemoveDirectory is the sequence of the following:
@@ -1299,6 +1366,14 @@ static VOID fsp_fuse_intf_Cleanup(FSP_FILE_SYSTEM *FileSystem,
      * option, file systems that would need the hard_remove option can instead use the
      * LegacyUnlinkRename option to opt out of the POSIX unlink semantics.
      */
+
+    if (f->FlushOnCleanup && !filedesc->IsDirectory && !filedesc->IsReparsePoint) {
+        memset(&fi, 0, sizeof fi);
+        fi.flags = filedesc->OpenFlags;
+        fi.fh = filedesc->FileHandle;
+        if (0 != f->ops.flush)
+            f->ops.flush(filedesc->PosixPath, &fi);
+    }
 
     if (Flags & FspCleanupDelete)
         if (filedesc->IsDirectory && !filedesc->IsReparsePoint)
@@ -1335,7 +1410,7 @@ static VOID fsp_fuse_intf_Close(FSP_FILE_SYSTEM *FileSystem,
     }
     else
     {
-        if (0 != f->ops.flush)
+        if (!f->FlushOnCleanup && 0 != f->ops.flush)
             f->ops.flush(filedesc->PosixPath, &fi);
         if (0 != f->ops.release)
             f->ops.release(filedesc->PosixPath, &fi);
@@ -1908,7 +1983,7 @@ int fsp_fuse_intf_AddDirInfo(void *buf, const char *name,
     }
 
     SizeA = lstrlenA(name);
-    if (SizeA > 255)
+    if (SizeA > 255 * 4)
     {
         fsp_fuse_intf_LogBadDirInfo(filedesc->PosixPath, name,
             "too long");
@@ -1918,6 +1993,13 @@ int fsp_fuse_intf_AddDirInfo(void *buf, const char *name,
     SizeW = MultiByteToWideChar(CP_UTF8, 0, name, SizeA, DirInfo->FileNameBuf, 255);
     if (0 == SizeW)
     {
+        if (ERROR_INSUFFICIENT_BUFFER == GetLastError())
+        {
+            fsp_fuse_intf_LogBadDirInfo(filedesc->PosixPath, name,
+                "too long");
+            return 0;
+        }
+
         fsp_fuse_intf_LogBadDirInfo(filedesc->PosixPath, name,
             "MultiByteToWideChar failed");
         return 0;
@@ -1960,7 +2042,7 @@ static NTSTATUS fsp_fuse_intf_FixDirInfo(FSP_FILE_SYSTEM *FileSystem,
     NTSTATUS Result;
 
     SizeA = lstrlenA(filedesc->PosixPath);
-    PosixPath = MemAlloc(SizeA + 1 + 255 + 1);
+    PosixPath = MemAlloc(SizeA + 1 + 255 * 4 + 1);
     if (0 == PosixPath)
     {
         Result = STATUS_INSUFFICIENT_RESOURCES;
@@ -2009,7 +2091,7 @@ static NTSTATUS fsp_fuse_intf_FixDirInfo(FSP_FILE_SYSTEM *FileSystem,
             else
             {
                 PosixPathEnd = 0;
-                SizeA = WideCharToMultiByte(CP_UTF8, 0, DirInfo->FileNameBuf, SizeW, PosixName, 255, 0, 0);
+                SizeA = WideCharToMultiByte(CP_UTF8, 0, DirInfo->FileNameBuf, SizeW, PosixName, 255 * 4, 0, 0);
                 if (0 == SizeA)
                 {
                     /* this should never happen because we just converted using MultiByteToWideChar */
@@ -2112,6 +2194,10 @@ static NTSTATUS fsp_fuse_intf_GetDirInfoByName(FSP_FILE_SYSTEM *FileSystem,
     char PosixPath[FSP_FSCTL_TRANSACT_PATH_SIZEMAX / sizeof(WCHAR)];
     int ParentLength, FSlashLength, PosixNameLength;
     UINT32 Uid, Gid, Mode;
+    char PosixNormalizedName[FSP_FSCTL_TRANSACT_PATH_SIZEMAX / sizeof(WCHAR)];
+    PWSTR NormalizedName, NormalizedNameSuffix;
+    ULONG NormalizedNameSize;
+    BOOLEAN Normalized = FALSE;
     NTSTATUS Result;
 
     if (!filedesc->IsDirectory || filedesc->IsReparsePoint)
@@ -2145,13 +2231,33 @@ static NTSTATUS fsp_fuse_intf_GetDirInfoByName(FSP_FILE_SYSTEM *FileSystem,
         goto exit;
     }
 
-    /*
-     * FUSE does not do FileName normalization; so just return the FileName as given to us!
-     */
-
     //memset(DirInfo->Padding, 0, sizeof DirInfo->Padding);
-    DirInfo->Size = (UINT16)(sizeof(FSP_FSCTL_DIR_INFO) + lstrlenW(FileName) * sizeof(WCHAR));
-    memcpy(DirInfo->FileNameBuf, FileName, DirInfo->Size - sizeof(FSP_FSCTL_DIR_INFO));
+
+    if (!f->VolumeParams.CaseSensitiveSearch && 0 != f->ops.getpath)
+    {
+        if (0 == f->ops.getpath(PosixPath, PosixNormalizedName, sizeof PosixNormalizedName, 0) &&
+            NT_SUCCESS(FspPosixMapPosixToWindowsPath(PosixNormalizedName, &NormalizedName)))
+        {
+            NormalizedNameSuffix = NormalizedName;
+            for (PWSTR P = NormalizedNameSuffix; *P; P++)
+                if (L'\\' == *P)
+                    NormalizedNameSuffix = P + 1;
+            NormalizedNameSize = lstrlenW(NormalizedNameSuffix) * sizeof(WCHAR);
+            if (f->VolumeParams.MaxComponentLength * sizeof(WCHAR) >= NormalizedNameSize)
+            {
+                DirInfo->Size = (UINT16)(sizeof(FSP_FSCTL_DIR_INFO) + NormalizedNameSize);
+                memcpy(DirInfo->FileNameBuf, NormalizedNameSuffix, NormalizedNameSize);
+                Normalized = TRUE;
+            }
+            FspPosixDeletePath(NormalizedName);
+        }
+    }
+
+    if (!Normalized)
+    {
+        DirInfo->Size = (UINT16)(sizeof(FSP_FSCTL_DIR_INFO) + lstrlenW(FileName) * sizeof(WCHAR));
+        memcpy(DirInfo->FileNameBuf, FileName, DirInfo->Size - sizeof(FSP_FSCTL_DIR_INFO));
+    }
 
     Result = STATUS_SUCCESS;
 
@@ -2573,6 +2679,17 @@ static NTSTATUS fsp_fuse_intf_SetEa(FSP_FILE_SYSTEM *FileSystem,
         &Uid, &Gid, &Mode, FileInfo);
 }
 
+static VOID fsp_fuse_intf_DispatcherStopped(FSP_FILE_SYSTEM *FileSystem,
+    BOOLEAN Normally)
+{
+    if (Normally)
+        return;
+
+    struct fuse *f = FileSystem->UserContext;
+
+    fsp_fuse_exit(f->env, f);
+}
+
 FSP_FILE_SYSTEM_INTERFACE fsp_fuse_intf =
 {
     fsp_fuse_intf_GetVolumeInfo,
@@ -2606,6 +2723,8 @@ FSP_FILE_SYSTEM_INTERFACE fsp_fuse_intf =
     fsp_fuse_intf_Overwrite,
     fsp_fuse_intf_GetEa,
     fsp_fuse_intf_SetEa,
+    0,
+    fsp_fuse_intf_DispatcherStopped,
 };
 
 /*

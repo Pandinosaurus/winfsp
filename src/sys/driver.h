@@ -1,7 +1,7 @@
 /**
  * @file sys/driver.h
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -304,6 +304,48 @@ VOID FspTraceNtStatus(const char *file, int line, const char *func, NTSTATUS Sta
         }                               \
     );                                  \
     return Result
+#define FSP_ENTER_FIO(...)              \
+    PDEVICE_OBJECT FsvolDeviceObject;   \
+    switch (FspDeviceExtension(DeviceObject)->Kind)\
+    {                                   \
+    case FspFsmupDeviceExtensionKind:   \
+        FsvolDeviceObject = FspMupGetFsvolDeviceObject(FileObject);\
+        if (0 == FsvolDeviceObject)     \
+        {                               \
+            IoStatus->Status = STATUS_INVALID_DEVICE_REQUEST;\
+            IoStatus->Information = 0;  \
+            return TRUE;                \
+        }                               \
+        break;                          \
+    case FspFsvolDeviceExtensionKind:   \
+        FsvolDeviceObject = DeviceObject;\
+        break;                          \
+    default:                            \
+        return FALSE;                   \
+    }                                   \
+    BOOLEAN Result = TRUE;              \
+    BOOLEAN fsp_device_deref = FALSE;   \
+    FSP_ENTER_(ioentr, __VA_ARGS__);    \
+    do                                  \
+    {                                   \
+        ASSERT(0 == IoGetTopLevelIrp()); \
+        IoSetTopLevelIrp((PIRP)FSRTL_FAST_IO_TOP_LEVEL_IRP); \
+        if (!FspDeviceReference(FsvolDeviceObject))\
+        {                               \
+            IoStatus->Status = STATUS_CANCELLED;\
+            IoStatus->Information = 0;  \
+            goto fsp_leave_label;       \
+        }                               \
+        fsp_device_deref = TRUE;        \
+    } while (0,0)
+#define FSP_LEAVE_FIO(fmt, ...)         \
+    FSP_LEAVE_(                         \
+        FSP_DEBUGLOG_(fmt, " = %s", __VA_ARGS__, Result ? "TRUE" : "FALSE");\
+        if (fsp_device_deref)           \
+            FspDeviceDereference(FsvolDeviceObject);\
+        IoSetTopLevelIrp(0);            \
+    );                                  \
+    return Result
 #define FSP_ENTER_BOOL(...)             \
     BOOLEAN Result = TRUE; FSP_ENTER_(iocall, __VA_ARGS__)
 #define FSP_LEAVE_BOOL(fmt, ...)        \
@@ -321,6 +363,10 @@ VOID FspTraceNtStatus(const char *file, int line, const char *func, NTSTATUS Sta
 
 /* missing typedef */
 typedef const void *PCVOID;
+
+/* driver unload */
+NTSTATUS FspDriverUnload(
+    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 
 /* driver major functions */
 _Function_class_(DRIVER_DISPATCH)
@@ -383,6 +429,9 @@ FSP_IOPREP_DISPATCH FspFsvolWritePrepare;
 FSP_IOCMPL_DISPATCH FspFsvolWriteComplete;
 
 /* fast I/O and resource acquisition callbacks */
+FAST_IO_DEVICE_CONTROL FspFastIoDeviceControl;
+FAST_IO_READ FspFastIoRead;
+FAST_IO_WRITE FspFastIoWrite;
 FAST_IO_QUERY_BASIC_INFO FspFastIoQueryBasicInfo;
 FAST_IO_QUERY_STANDARD_INFO FspFastIoQueryStandardInfo;
 FAST_IO_QUERY_NETWORK_OPEN_INFO FspFastIoQueryNetworkOpenInfo;
@@ -521,7 +570,7 @@ BOOLEAN FspFileNameIsPrefix(
 #else
 #define FspFileNameUpcase(D,S,U)        (ASSERT(0 == (U)), RtlUpcaseUnicodeString(D,S,FALSE))
 #define FspEaNameUpcase(D,S,U)          (ASSERT(0 == (U)), RtlUpperString(D,S))
-#define FspFileNameCompare(N1,N2,I,U)   (ASSERT(0 == (U)), RtlCompareUnicodeString(N1,N2,I))
+#define FspFileNameCompare(N1,N2,I,U)   (ASSERT(0 == (U)), FspCompareUnicodeString(N1,N2,I))
 #define FspFileNameIsPrefix(N1,N2,I,U)  (ASSERT(0 == (U)), RtlPrefixUnicodeString(N1,N2,I))
 #endif
 NTSTATUS FspFileNameInExpression(
@@ -643,18 +692,24 @@ NTSTATUS FspOplockFsctrl(
     FspNotifyFullReportChange(NS, NL, (PSTRING)(FN), FO, 0, (PSTRING)(NP), F, A, 0)
 #define FSP_NEXT_EA(Ea, EaEnd)          \
     (0 != (Ea)->NextEntryOffset ? (PVOID)((PUINT8)(Ea) + (Ea)->NextEntryOffset) : (EaEnd))
+#define FSP_FUNCTION_FROM_CTL_CODE(ControlCode)\
+    (((ControlCode) >> 2) & 0xfff)
 
 /* utility: synchronous work queue */
 typedef struct
 {
-    KEVENT Event;
+    LONG RefCount;
     PWORKER_THREAD_ROUTINE Routine;
     PVOID Context;
+    KEVENT Event;
     WORK_QUEUE_ITEM WorkQueueItem;
 } FSP_SYNCHRONOUS_WORK_ITEM;
+FSP_SYNCHRONOUS_WORK_ITEM *FspAllocateSynchronousWorkItem(
+    PWORKER_THREAD_ROUTINE Routine, PVOID Context);
 VOID FspInitializeSynchronousWorkItem(FSP_SYNCHRONOUS_WORK_ITEM *SynchronousWorkItem,
     PWORKER_THREAD_ROUTINE Routine, PVOID Context);
-VOID FspExecuteSynchronousWorkItem(FSP_SYNCHRONOUS_WORK_ITEM *SynchronousWorkItem);
+NTSTATUS FspExecuteSynchronousWorkItem(FSP_SYNCHRONOUS_WORK_ITEM *SynchronousWorkItem,
+    BOOLEAN Alertable);
 
 /* utility: delayed work queue */
 typedef struct
@@ -686,44 +741,40 @@ VOID FspIrpHookReset(PIRP Irp);
 PVOID FspIrpHookContext(PVOID Context);
 NTSTATUS FspIrpHookNext(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context);
 
-/* utility: wait groups
- *
- * A Wait Group is a synchronization primitive that encapsulates a counter.
- * A Wait Group is considered signaled when the counter is 0 and non-signaled
- * when the counter is non-0. (Wait Group functionality is similar to Golang's
- * sync.WaitGroup.)
- *
- * Wait Groups must always be allocated in non-paged storage.
- */
-typedef struct
-{
-    KEVENT Event;
-    LONG Count;
-    KSPIN_LOCK SpinLock;
-} FSP_WGROUP;
-VOID FspWgroupInitialize(FSP_WGROUP *Wgroup);
-VOID FspWgroupIncrement(FSP_WGROUP *Wgroup);
-VOID FspWgroupDecrement(FSP_WGROUP *Wgroup);
-VOID FspWgroupSignalPermanently(FSP_WGROUP *Wgroup);
-NTSTATUS FspWgroupWait(FSP_WGROUP *Wgroup,
-    KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER PTimeout);
+/* utility: string compare */
+LONG FspCompareUnicodeString(
+    PCUNICODE_STRING String1,
+    PCUNICODE_STRING String2,
+    BOOLEAN CaseInsensitive);
+
+/* SxS */
+VOID FspSxsIdentInitialize(PUNICODE_STRING DriverName);
+PUNICODE_STRING FspSxsIdent(VOID);
+PUNICODE_STRING FspSxsSuffix(VOID);
 
 /* silos */
 typedef struct
 {
+    PVOID Silo;
+    LIST_ENTRY ListEntry;
     PDEVICE_OBJECT FsctlDiskDeviceObject;
     PDEVICE_OBJECT FsctlNetDeviceObject;
     PDEVICE_OBJECT FsmupDeviceObject;
     HANDLE MupHandle;
-    WCHAR FsmupDeviceNameBuf[64];
+    WCHAR FsmupDeviceNameBuf[128];
+    UINT32 InitDoneSymlinkDisk:1, InitDoneSymlinkNet:1, InitDoneRegisterDisk:1;
 } FSP_SILO_GLOBALS;
 typedef NTSTATUS (*FSP_SILO_INIT_CALLBACK)(VOID);
 typedef VOID (*FSP_SILO_FINI_CALLBACK)(VOID);
+typedef VOID (*FSP_SILO_ENUM_CALLBACK)(VOID);
+BOOLEAN FspSiloIsHost(VOID);
 NTSTATUS FspSiloGetGlobals(FSP_SILO_GLOBALS **PGlobals);
 VOID FspSiloDereferenceGlobals(FSP_SILO_GLOBALS *Globals);
 VOID FspSiloGetContainerId(GUID *ContainerId);
 NTSTATUS FspSiloInitialize(FSP_SILO_INIT_CALLBACK Init, FSP_SILO_FINI_CALLBACK Fini);
+NTSTATUS FspSiloPostInitialize(VOID);
 VOID FspSiloFinalize(VOID);
+VOID FspSiloEnumerate(FSP_SILO_ENUM_CALLBACK EnumFn);
 
 /* process buffers */
 #define FspProcessBufferSizeMax         (64 * 1024)
@@ -904,7 +955,7 @@ retry:
     {
         if (PsIsThreadTerminating(PsGetCurrentThread()))
             return STATUS_THREAD_IS_TERMINATING;
-        if (0 != Irp && Irp->Cancel)
+        if (0 != Irp && ((PIRP)FSRTL_MAX_TOP_LEVEL_IRP_FLAG >= Irp || Irp->Cancel))
             return STATUS_CANCELLED;
         if (0 != ExpirationTime)
         {
@@ -1110,7 +1161,7 @@ enum
     FspFsvolDeviceSecurityCacheCapacity = 100,
     FspFsvolDeviceSecurityCacheItemSizeMax = 4096,
     FspFsvolDeviceDirInfoCacheCapacity = 100,
-    FspFsvolDeviceDirInfoCacheItemSizeMax = FSP_FSCTL_ALIGN_UP(16384, PAGE_SIZE),
+    FspFsvolDeviceDirInfoCacheItemSizeMax = FSP_FSCTL_ALIGN_UP(FspProcessBufferSizeMax, PAGE_SIZE),
     FspFsvolDeviceStreamInfoCacheCapacity = 100,
     FspFsvolDeviceStreamInfoCacheItemSizeMax = FSP_FSCTL_ALIGN_UP(16384, PAGE_SIZE),
     FspFsvolDeviceEaCacheCapacity = 100,
@@ -1150,9 +1201,8 @@ typedef struct
     KSPIN_LOCK SpinLock;
     LONG RefCount;
     UINT32 Kind;
-    GUID SiloContainerId;
-    /* IoTimer emulation */
-    FSP_DEVICE_TIMER DeviceTimer;
+    FSP_DEVICE_TIMER DeviceTimer;       /* IoTimer emulation */
+    LONG DidIoDeleteDevice;
 } FSP_DEVICE_EXTENSION;
 typedef struct
 {
@@ -1180,8 +1230,10 @@ typedef struct
     KSPIN_LOCK ExpirationLock;
     WORK_QUEUE_ITEM ExpirationWorkItem;
     BOOLEAN ExpirationInProgress;
+    ERESOURCE VolumeDeleteResource;
+    BOOLEAN VolumeDeleted;
     ERESOURCE FileRenameResource;
-    ERESOURCE ContextTableResource;
+    FAST_MUTEX ContextTableMutex;
     LIST_ENTRY ContextList;
     RTL_AVL_TABLE ContextByNameTable;
     PVOID ContextByNameTableElementStorage;
@@ -1190,8 +1242,8 @@ typedef struct
     KSPIN_LOCK InfoSpinLock;
     UINT64 InfoExpirationTime;
     FSP_FSCTL_VOLUME_INFO VolumeInfo;
-    LONG VolumeNotifyLock;
-    FSP_WGROUP VolumeNotifyWgroup;
+    FAST_MUTEX VolumeNotifyMutex;
+    LONG VolumeNotifyCount;
     PNOTIFY_SYNC NotifySync;
     LIST_ENTRY NotifyList;
     FSP_STATISTICS *Statistics;
@@ -1199,19 +1251,24 @@ typedef struct
 } FSP_FSVOL_DEVICE_EXTENSION;
 typedef struct
 {
+    /* read-only after creation (and insertion in the ContextTable) */
     FSP_DEVICE_EXTENSION Base;
     UINT16 SectorSize;
-    LONG IsMountdev;
-    BOOLEAN Persistent;
-    GUID UniqueId;
     UNICODE_STRING VolumeName;
     WCHAR VolumeNameBuf[FSP_FSCTL_VOLUME_NAME_SIZE / sizeof(WCHAR)];
+    FAST_MUTEX MountMutex;
+    /* interlocked access */
+    LONG IsMountdev;
+    /* protected under MountMutex */
+    BOOLEAN Persistent;
+    GUID UniqueId;
+    UNICODE_STRING MountPoint;
 } FSP_FSVRT_DEVICE_EXTENSION;
 typedef struct
 {
     FSP_DEVICE_EXTENSION Base;
     UINT32 InitDonePfxTab:1;
-    ERESOURCE PrefixTableResource;
+    FAST_MUTEX PrefixTableMutex;
     UNICODE_PREFIX_TABLE PrefixTable;
     UNICODE_PREFIX_TABLE ClassTable;
 } FSP_FSMUP_DEVICE_EXTENSION;
@@ -1247,18 +1304,127 @@ NTSTATUS FspDeviceCreate(UINT32 Kind, ULONG ExtraSize,
     PDEVICE_OBJECT *PDeviceObject);
 NTSTATUS FspDeviceInitialize(PDEVICE_OBJECT DeviceObject);
 VOID FspDeviceDelete(PDEVICE_OBJECT DeviceObject);
+VOID FspDeviceDoIoDeleteDevice(PDEVICE_OBJECT DeviceObject);
 BOOLEAN FspDeviceReference(PDEVICE_OBJECT DeviceObject);
 VOID FspDeviceDereference(PDEVICE_OBJECT DeviceObject);
-VOID FspFsvolDeviceFileRenameAcquireShared(PDEVICE_OBJECT DeviceObject);
-BOOLEAN FspFsvolDeviceFileRenameTryAcquireShared(PDEVICE_OBJECT DeviceObject);
-VOID FspFsvolDeviceFileRenameAcquireExclusive(PDEVICE_OBJECT DeviceObject);
-BOOLEAN FspFsvolDeviceFileRenameTryAcquireExclusive(PDEVICE_OBJECT DeviceObject);
-VOID FspFsvolDeviceFileRenameSetOwner(PDEVICE_OBJECT DeviceObject, PVOID Owner);
-VOID FspFsvolDeviceFileRenameRelease(PDEVICE_OBJECT DeviceObject);
-VOID FspFsvolDeviceFileRenameReleaseOwner(PDEVICE_OBJECT DeviceObject, PVOID Owner);
-BOOLEAN FspFsvolDeviceFileRenameIsAcquiredExclusive(PDEVICE_OBJECT DeviceObject);
-VOID FspFsvolDeviceLockContextTable(PDEVICE_OBJECT DeviceObject);
-VOID FspFsvolDeviceUnlockContextTable(PDEVICE_OBJECT DeviceObject);
+static inline
+VOID FspFsvolDeviceVolumeDeleteAcquireShared(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    ExAcquireResourceSharedLite(&FsvolDeviceExtension->VolumeDeleteResource, TRUE);
+}
+static inline
+VOID FspFsvolDeviceVolumeDeleteAcquireExclusive(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    ExAcquireResourceExclusiveLite(&FsvolDeviceExtension->VolumeDeleteResource, TRUE);
+}
+static inline
+VOID FspFsvolDeviceVolumeDeleteSetOwner(PDEVICE_OBJECT DeviceObject, PVOID Owner)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    Owner = (PVOID)((UINT_PTR)Owner | 3);
+    ExSetResourceOwnerPointer(&FsvolDeviceExtension->VolumeDeleteResource, Owner);
+}
+static inline
+VOID FspFsvolDeviceVolumeDeleteRelease(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    ExReleaseResourceLite(&FsvolDeviceExtension->VolumeDeleteResource);
+}
+static inline
+VOID FspFsvolDeviceVolumeDeleteReleaseOwner(PDEVICE_OBJECT DeviceObject, PVOID Owner)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    Owner = (PVOID)((UINT_PTR)Owner | 3);
+    if (ExIsResourceAcquiredLite(&FsvolDeviceExtension->VolumeDeleteResource))
+        ExReleaseResourceLite(&FsvolDeviceExtension->VolumeDeleteResource);
+    else
+        ExReleaseResourceForThreadLite(&FsvolDeviceExtension->VolumeDeleteResource, (ERESOURCE_THREAD)Owner);
+}
+static inline
+VOID FspFsvolDeviceFileRenameAcquireShared(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    ExAcquireResourceSharedLite(&FsvolDeviceExtension->FileRenameResource, TRUE);
+}
+static inline
+BOOLEAN FspFsvolDeviceFileRenameTryAcquireShared(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    return ExAcquireResourceSharedLite(&FsvolDeviceExtension->FileRenameResource, FALSE);
+}
+static inline
+VOID FspFsvolDeviceFileRenameAcquireExclusive(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    ExAcquireResourceExclusiveLite(&FsvolDeviceExtension->FileRenameResource, TRUE);
+}
+static inline
+BOOLEAN FspFsvolDeviceFileRenameTryAcquireExclusive(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    return ExAcquireResourceExclusiveLite(&FsvolDeviceExtension->FileRenameResource, FALSE);
+}
+static inline
+VOID FspFsvolDeviceFileRenameAcquireSharedStarveExclusive(PDEVICE_OBJECT DeviceObject)
+{
+    /*
+     * Acquire the file rename resource shared, but starve (ignore) any QUEUED
+     * exclusive waiter. Used by FspVolumeNotifyWork: a notify session opened by
+     * FspFileSystemNotifyBegin already holds this resource shared (via owner
+     * pointer) and intentionally defers renames until FspFileSystemNotifyEnd. A
+     * plain ExAcquireResourceSharedLite here would honor a concurrently queued
+     * exclusive rename waiter and block -- but the very work item that blocks is
+     * the one that must run FspFileSystemNotifyEnd processing to release the
+     * session and let that rename proceed, so the two self-deadlock. Starving the
+     * queued exclusive waiter is safe: the rename stays blocked behind the shared
+     * holders either way, so name stability across the notify is preserved.
+     */
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    ExAcquireSharedStarveExclusive(&FsvolDeviceExtension->FileRenameResource, TRUE);
+}
+static inline
+VOID FspFsvolDeviceFileRenameSetOwner(PDEVICE_OBJECT DeviceObject, PVOID Owner)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    Owner = (PVOID)((UINT_PTR)Owner | 3);
+    ExSetResourceOwnerPointer(&FsvolDeviceExtension->FileRenameResource, Owner);
+}
+static inline
+VOID FspFsvolDeviceFileRenameRelease(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    ExReleaseResourceLite(&FsvolDeviceExtension->FileRenameResource);
+}
+static inline
+VOID FspFsvolDeviceFileRenameReleaseOwner(PDEVICE_OBJECT DeviceObject, PVOID Owner)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    Owner = (PVOID)((UINT_PTR)Owner | 3);
+    if (ExIsResourceAcquiredLite(&FsvolDeviceExtension->FileRenameResource))
+        ExReleaseResourceLite(&FsvolDeviceExtension->FileRenameResource);
+    else
+        ExReleaseResourceForThreadLite(&FsvolDeviceExtension->FileRenameResource, (ERESOURCE_THREAD)Owner);
+}
+static inline
+BOOLEAN FspFsvolDeviceFileRenameIsAcquiredExclusive(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    return ExIsResourceAcquiredExclusiveLite(&FsvolDeviceExtension->FileRenameResource);
+}
+static inline
+VOID FspFsvolDeviceLockContextTable(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    ExAcquireFastMutexUnsafe(&FsvolDeviceExtension->ContextTableMutex);
+}
+static inline
+VOID FspFsvolDeviceUnlockContextTable(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    ExReleaseFastMutexUnsafe(&FsvolDeviceExtension->ContextTableMutex);
+}
 NTSTATUS FspFsvolDeviceCopyContextList(PDEVICE_OBJECT DeviceObject,
     PVOID **PContexts, PULONG PContextCount);
 NTSTATUS FspFsvolDeviceCopyContextByNameList(PDEVICE_OBJECT DeviceObject,
@@ -1275,6 +1441,18 @@ VOID FspFsvolDeviceGetVolumeInfo(PDEVICE_OBJECT DeviceObject, FSP_FSCTL_VOLUME_I
 BOOLEAN FspFsvolDeviceTryGetVolumeInfo(PDEVICE_OBJECT DeviceObject, FSP_FSCTL_VOLUME_INFO *VolumeInfo);
 VOID FspFsvolDeviceSetVolumeInfo(PDEVICE_OBJECT DeviceObject, const FSP_FSCTL_VOLUME_INFO *VolumeInfo);
 VOID FspFsvolDeviceInvalidateVolumeInfo(PDEVICE_OBJECT DeviceObject);
+static inline
+VOID FspFsvolDeviceLockVolumeNotify(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    ExAcquireFastMutexUnsafe(&FsvolDeviceExtension->VolumeNotifyMutex);
+}
+static inline
+VOID FspFsvolDeviceUnlockVolumeNotify(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(DeviceObject);
+    ExReleaseFastMutexUnsafe(&FsvolDeviceExtension->VolumeNotifyMutex);
+}
 #if defined(FSP_CFG_REJECT_EARLY_IRP)
 static inline
 BOOLEAN FspFsvolDeviceReadyToAcceptIrp(PDEVICE_OBJECT DeviceObject)
@@ -1299,11 +1477,34 @@ BOOLEAN FspFsvolDeviceVolumePrefixInString(PDEVICE_OBJECT DeviceObject, PUNICODE
     return RtlPrefixUnicodeString(&FspFsvolDeviceExtension(DeviceObject)->VolumePrefix, String,
         TRUE);
 }
+static inline
+VOID FspFsvrtDeviceLockMount(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVRT_DEVICE_EXTENSION *FsvrtDeviceExtension = FspFsvrtDeviceExtension(DeviceObject);
+    ExAcquireFastMutexUnsafe(&FsvrtDeviceExtension->MountMutex);
+}
+static inline
+VOID FspFsvrtDeviceUnlockMount(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSVRT_DEVICE_EXTENSION *FsvrtDeviceExtension = FspFsvrtDeviceExtension(DeviceObject);
+    ExReleaseFastMutexUnsafe(&FsvrtDeviceExtension->MountMutex);
+}
+static inline
+VOID FspFsmupDeviceLockPrefixTable(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSMUP_DEVICE_EXTENSION *FsmupDeviceExtension = FspFsmupDeviceExtension(DeviceObject);
+    ExAcquireFastMutexUnsafe(&FsmupDeviceExtension->PrefixTableMutex);
+}
+static inline
+VOID FspFsmupDeviceUnlockPrefixTable(PDEVICE_OBJECT DeviceObject)
+{
+    FSP_FSMUP_DEVICE_EXTENSION *FsmupDeviceExtension = FspFsmupDeviceExtension(DeviceObject);
+    ExReleaseFastMutexUnsafe(&FsmupDeviceExtension->PrefixTableMutex);
+}
 NTSTATUS FspDeviceCopyList(
     PDEVICE_OBJECT **PDeviceObjects, PULONG PDeviceObjectCount);
 VOID FspDeviceDeleteList(
     PDEVICE_OBJECT *DeviceObjects, ULONG DeviceObjectCount);
-VOID FspDeviceDeleteAll(VOID);
 NTSTATUS FspDeviceInitializeAllTimers(VOID);
 VOID FspDeviceFinalizeAllTimers(VOID);
 NTSTATUS FspDeviceInitializeTimer(PDEVICE_OBJECT DeviceObject,
@@ -1313,14 +1514,14 @@ VOID FspDeviceStopTimer(PDEVICE_OBJECT DeviceObject);
 static inline
 VOID FspDeviceGlobalLock(VOID)
 {
-    extern ERESOURCE FspDeviceGlobalResource;
-    ExAcquireResourceExclusiveLite(&FspDeviceGlobalResource, TRUE);
+    extern FAST_MUTEX FspDeviceGlobalMutex;
+    ExAcquireFastMutexUnsafe(&FspDeviceGlobalMutex);
 }
 static inline
 VOID FspDeviceGlobalUnlock(VOID)
 {
-    extern ERESOURCE FspDeviceGlobalResource;
-    ExReleaseResourceLite(&FspDeviceGlobalResource);
+    extern FAST_MUTEX FspDeviceGlobalMutex;
+    ExReleaseFastMutexUnsafe(&FspDeviceGlobalMutex);
 }
 #define FspFsvolDeviceStatistics(DeviceObject)\
     FspStatistics(FspFsvolDeviceExtension(DeviceObject)->Statistics)
@@ -1377,11 +1578,23 @@ NTSTATUS FspMountdevMake(
 VOID FspMountdevFini(
     PDEVICE_OBJECT FsvrtDeviceObject);
 
+/* mountmgr */
+NTSTATUS FspMountmgrCreateDrive(
+    PUNICODE_STRING VolumeName, GUID *UniqueId, PUNICODE_STRING MountPoint);
+NTSTATUS FspMountmgrDeleteDrive(
+    PUNICODE_STRING MountPoint);
+NTSTATUS FspMountmgrNotifyCreateDirectory(
+    PUNICODE_STRING VolumeName, GUID *UniqueId, PUNICODE_STRING MountPoint);
+NTSTATUS FspMountmgrNotifyDeleteDirectory(
+    PUNICODE_STRING VolumeName, PUNICODE_STRING MountPoint);
+
 /* fsmup */
 NTSTATUS FspMupRegister(
     PDEVICE_OBJECT FsmupDeviceObject, PDEVICE_OBJECT FsvolDeviceObject);
 VOID FspMupUnregister(
     PDEVICE_OBJECT FsmupDeviceObject, PDEVICE_OBJECT FsvolDeviceObject);
+PDEVICE_OBJECT FspMupGetFsvolDeviceObject(
+    PFILE_OBJECT FileObject);
 NTSTATUS FspMupHandleIrp(
     PDEVICE_OBJECT FsmupDeviceObject, PIRP Irp);
 
@@ -1394,12 +1607,23 @@ NTSTATUS FspVolumeMount(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeMakeMountdev(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+NTSTATUS FspVolumeUseMountmgr(
+    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeGetName(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeGetNameList(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeTransact(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+NTSTATUS FspVolumeFastTransact(
+    PDEVICE_OBJECT FsvolDeviceObject,
+    ULONG ControlCode,
+    PVOID InputBuffer,
+    ULONG InputBufferLength,
+    PVOID OutputBuffer,
+    ULONG OutputBufferLength,
+    PIO_STATUS_BLOCK IoStatus,
+    PIRP Irp);
 NTSTATUS FspVolumeTransactFsext(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeStop(
@@ -1410,6 +1634,7 @@ NTSTATUS FspVolumeWork(
     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 
 /* file objects */
+//#define FSP_FILE_NODE_NO_PGIO
 #define FspFileNodeKind(FileNode)       \
     (((FSP_FILE_NODE *)FileNode)->Header.NodeTypeCode)
 #define FspFileNodeIsValid(FileNode)    \
@@ -1449,7 +1674,7 @@ typedef struct FSP_FILE_NODE
     /* interlocked access */
     LONG RefCount;
     UINT32 DeletePending;
-    /* locked under FSP_FSVOL_DEVICE_EXTENSION::ContextTableResource */
+    /* locked under FSP_FSVOL_DEVICE_EXTENSION::ContextTableMutex */
     LONG ActiveCount;                   /* CREATE w/o CLOSE count */
     LONG OpenCount;                     /* ContextTable ref count */
     LONG HandleCount;                   /* HANDLE count (CREATE/CLEANUP) */
@@ -1542,6 +1767,16 @@ VOID FspFileNodeDereference(FSP_FILE_NODE *FileNode)
     LONG RefCount = InterlockedDecrement(&FileNode->RefCount);
     if (0 == RefCount)
         FspFileNodeDelete(FileNode);
+}
+static inline
+BOOLEAN FspFileNodeDeletePending(FSP_FILE_NODE *FileNode)
+{
+    return 0 != FspInterlockedLoad32((INT32 *)&FileNode->DeletePending);
+}
+static inline
+VOID FspFileNodeSetDeletePending(FSP_FILE_NODE *FileNode, BOOLEAN Delete)
+{
+    FspInterlockedStore32((INT32 *)&FileNode->DeletePending, Delete);
 }
 VOID FspFileNodeAcquireSharedF(FSP_FILE_NODE *FileNode, ULONG Flags);
 BOOLEAN FspFileNodeTryAcquireSharedF(FSP_FILE_NODE *FileNode, ULONG Flags, BOOLEAN Wait);
@@ -1801,9 +2036,11 @@ FSP_MV_CcCoherencyFlushAndPurgeCache(
 extern PDRIVER_OBJECT FspDriverObject;
 extern FAST_IO_DISPATCH FspFastIoDispatch;
 extern CACHE_MANAGER_CALLBACKS FspCacheManagerCallbacks;
+extern FAST_MUTEX FspDriverUnloadMutex;
+extern BOOLEAN FspDriverUnloadDone;
 extern FSP_IOPREP_DISPATCH *FspIopPrepareFunction[];
 extern FSP_IOCMPL_DISPATCH *FspIopCompleteFunction[];
-extern ERESOURCE FspDeviceGlobalResource;
+extern FAST_MUTEX FspDeviceGlobalMutex;
 extern WCHAR FspFileDescDirectoryPatternMatchAll[];
 extern const GUID FspMainFileOpenEcpGuid;
 extern ULONG FspProcessorCount;

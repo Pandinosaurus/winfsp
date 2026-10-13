@@ -7,7 +7,7 @@ This document summarizes the changes made to WinFsp to support Windows on ARM64.
 * Visual Studio 2019 or later is required to build WinFsp. Visual Studio 2015 builds are no longer possible because of lack of ARM64 support.
 ** The script `tools\gensrc\remove-build-arm64.bat` can be used to remove the ARM64 configuration from the project files. This allows WinFsp to be built with Visual Studio 2015, but without ARM64 support. This is a hack to support AppVeyor builds on Server 2012 images that have only Visual Studio 2015 installed.
 * Build configuration is now done by the file `build.common.props` located in `build\VStudio`.
-* Product configuration (`MyProductName`, etc.) is still done by the file `version.properties` located in `build\VStudio`. Non-product configuration portions of the file have migrated to `build.common.props`, which includes `version.properties`.
+* Product configuration (`MyProductName`, etc.) is done by the file `build.version.props` located in `build\VStudio`. This file was previously named `version.properties`.
 * Project files under `build\VStudio` have been updated to support ARM64 builds.
 
 == Include Files
@@ -19,6 +19,7 @@ This document summarizes the changes made to WinFsp to support Windows on ARM64.
 == File System Driver
 
 * The `IoInitializeTimer`, `IoStartTimer` and `IoStopTimer` DDI's are missing from Windows on ARM64 (https://social.msdn.microsoft.com/Forums/en-US/e1f4dbbd-a3f1-40a4-8f8b-e12a04b1b074/is-iostarttimer-universal[link]). The same functionality is now implemented within WinFsp in file `src\sys\devtimer.c`
+* The FSD (and other WinFsp components) used a number of memory barriers primarily for the purpose of lock-free access of certain variables. Most of these memory barriers have been removed and replaced with "interlocked" loads/stores so that any such accesses would continue to be correct under ARM64, which has weaker consistency guarantees than x86/x64. The new `FspInterlocked*` calls are implemented in `inc/winfsp/fsctl.h` and are used by both kernel and user mode code.
 
 == Samples
 

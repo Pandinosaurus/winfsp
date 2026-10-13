@@ -1,7 +1,7 @@
 /**
  * @file dll/fsop.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -1142,7 +1142,8 @@ FSP_API NTSTATUS FspFileSystemOpSetInformation(FSP_FILE_SYSTEM *FileSystem,
         break;
     case 13/*FileDispositionInformation*/:
     case 64/*FileDispositionInformationEx*/:
-        if (0 == (0x10/*IGNORE_READONLY_ATTRIBUTE*/ & Request->Req.SetInformation.Info.DispositionEx.Flags) &&
+        if (1/*DELETE*/ == (0x11/*DELETE|IGNORE_READONLY_ATTRIBUTE*/ &
+                Request->Req.SetInformation.Info.DispositionEx.Flags) &&
             0 != FileSystem->Interface->GetFileInfo)
         {
             Result = FileSystem->Interface->GetFileInfo(FileSystem,
@@ -1881,4 +1882,13 @@ FSP_API BOOLEAN FspFileSystemAddNotifyInfo(FSP_FSCTL_NOTIFY_INFO *NotifyInfo,
     PVOID Buffer, ULONG Length, PULONG PBytesTransferred)
 {
     return FspFileSystemAddXxxInfo(NotifyInfo, Buffer, Length, PBytesTransferred);
+}
+
+FSP_API VOID FspFileSystemStopServiceIfNecessary(FSP_FILE_SYSTEM *FileSystem,
+    BOOLEAN Normally)
+{
+    /* NOTE: .NET calls us with a zero FileSystem pointer! */
+    if (Normally)
+        return;
+    FspServiceStopLoop();
 }

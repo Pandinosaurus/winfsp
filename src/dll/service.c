@@ -1,7 +1,7 @@
 /**
  * @file dll/service.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -40,6 +40,8 @@ enum
     GetStatus_WaitHint                  = 0x4000,
 };
 
+static SRWLOCK FspServiceLoopLock = SRWLOCK_INIT;
+static SRWLOCK FspServiceTableLock = SRWLOCK_INIT;
 static SERVICE_TABLE_ENTRYW *FspServiceTable;
 static HANDLE FspServiceConsoleModeEvent;
 static UINT32 FspServiceConsoleCtrlHandlerDisabled;
@@ -220,6 +222,14 @@ FSP_API ULONG FspServiceGetExitCode(FSP_SERVICE *Service)
 
 FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
 {
+    /*
+     * FspServiceLoop can only be called once per process, because of StartServiceCtrlDispatcherW
+     * (which returns ERROR_SERVICE_ALREADY_RUNNING if called more than once). Unfortunately this
+     * limitation was never documented and there may be users of FspServiceLoop out there that call
+     * it more than once per process.
+     */
+    AcquireSRWLockExclusive(&FspServiceLoopLock);
+
     NTSTATUS Result;
     SERVICE_TABLE_ENTRYW ServiceTable[2];
 
@@ -236,7 +246,9 @@ FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
     ServiceTable[0].lpServiceProc = FspServiceEntry;
     ServiceTable[1].lpServiceName = 0;
     ServiceTable[1].lpServiceProc = 0;
+    AcquireSRWLockExclusive(&FspServiceTableLock);
     FspServiceTable = ServiceTable;
+    ReleaseSRWLockExclusive(&FspServiceTableLock);
 
     if (!StartServiceCtrlDispatcherW(ServiceTable))
     {
@@ -275,8 +287,7 @@ FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
         else
         {
             ResetEvent(FspServiceConsoleModeEvent);
-            FspServiceConsoleCtrlHandlerDisabled = 0;
-            MemoryBarrier();
+            FspInterlockedStore32((INT32 *)&FspServiceConsoleCtrlHandlerDisabled, 0);
         }
 #endif
 
@@ -326,16 +337,46 @@ FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
          *
          * What we do instead is disable our handler by setting a variable.
          */
-        FspServiceConsoleCtrlHandlerDisabled = 1;
-        MemoryBarrier();
+        FspInterlockedStore32((INT32 *)&FspServiceConsoleCtrlHandlerDisabled, 1);
     }
 
     Result = STATUS_SUCCESS;
 
 exit:
+    AcquireSRWLockExclusive(&FspServiceTableLock);
     FspServiceTable = 0;
+    ReleaseSRWLockExclusive(&FspServiceTableLock);
+
+    ReleaseSRWLockExclusive(&FspServiceLoopLock);
 
     return Result;
+}
+
+static DWORD WINAPI FspServiceStopLoopThread(PVOID Context);
+VOID FspServiceStopLoop(VOID)
+{
+    BOOLEAN HasService;
+    HANDLE Thread;
+
+    AcquireSRWLockShared(&FspServiceTableLock);
+    HasService = 0 != FspServiceFromTable();
+    ReleaseSRWLockShared(&FspServiceTableLock);
+
+    if (HasService)
+    {
+        Thread = CreateThread(0, 0, FspServiceStopLoopThread, 0, 0, 0);
+        if (0 != Thread)
+            CloseHandle(Thread);
+    }
+}
+static DWORD WINAPI FspServiceStopLoopThread(PVOID Context)
+{
+    AcquireSRWLockShared(&FspServiceTableLock);
+    FSP_SERVICE *Service = FspServiceFromTable();
+    if (0 != Service)
+        FspServiceStop(Service);
+    ReleaseSRWLockShared(&FspServiceTableLock);
+    return 0;
 }
 
 FSP_API VOID FspServiceStop(FSP_SERVICE *Service)
@@ -395,6 +436,7 @@ static VOID WINAPI FspServiceEntry(DWORD Argc, PWSTR *Argv)
     FSP_SERVICE *Service;
 
     Service = FspServiceFromTable();
+        /* we are subordinate to FspServiceLoop; no need to protect this access with FspServiceTableLock */
     if (0 == Service)
     {
         FspServiceLog(EVENTLOG_ERROR_TYPE,
@@ -503,6 +545,7 @@ static DWORD WINAPI FspServiceConsoleModeThread(PVOID Context)
         ;
 
     Service = FspServiceFromTable();
+        /* we are subordinate to FspServiceLoop; no need to protect this access with FspServiceTableLock */
     if (0 == Service)
         FspServiceLog(EVENTLOG_ERROR_TYPE,
             L"" __FUNCTION__ ": internal error: FspServiceFromTable = 0");
@@ -517,8 +560,7 @@ static DWORD WINAPI FspServiceConsoleModeThread(PVOID Context)
 /* expose FspServiceConsoleCtrlHandler so it can be used from fsp_fuse_signal_handler */
 BOOL WINAPI FspServiceConsoleCtrlHandler(DWORD CtrlType)
 {
-    UINT32 Disabled = FspServiceConsoleCtrlHandlerDisabled;
-    MemoryBarrier();
+    UINT32 Disabled = FspInterlockedLoad32((INT32 *)&FspServiceConsoleCtrlHandlerDisabled);
     if (Disabled)
         return FALSE;
 

@@ -1,7 +1,7 @@
 /**
  * @file memfs.cpp
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -39,6 +39,11 @@ FSP_FSCTL_STATIC_ASSERT(MEMFS_MAX_PATH > MAX_PATH,
  * This macro should be defined in the Visual Studio project settings, Makefile, etc.
  */
 //#define MEMFS_STANDALONE
+
+/*
+ * Define the MEMFS_DISPATCHER_STOPPED macro to include DispatcherStopped support.
+ */
+#define MEMFS_DISPATCHER_STOPPED
 
 /*
  * Define the MEMFS_NAME_NORMALIZATION macro to include name normalization support.
@@ -183,6 +188,51 @@ UINT64 MemfsGetSystemTime(VOID)
 }
 
 static inline
+unsigned MemfsUpperChar(unsigned c)
+{
+    /*
+     * Bit-twiddling upper case char:
+     *
+     * - Let signbit(x) = x & 0x100 (treat bit 0x100 as "signbit").
+     * - 'A' <= c && c <= 'Z' <=> s = signbit(c - 'A') ^ signbit(c - ('Z' + 1)) == 1
+     *     - c >= 'A' <=> c - 'A' >= 0      <=> signbit(c - 'A') = 0
+     *     - c <= 'Z' <=> c - ('Z' + 1) < 0 <=> signbit(c - ('Z' + 1)) = 1
+     * - Bit 0x20 = 0x100 >> 3 toggles uppercase to lowercase and vice-versa.
+     *
+     * This is actually faster than `(c - 'a' <= 'z' - 'a') ? (c & ~0x20) : c`, even
+     * when compiled using cmov conditional moves at least on this system (i7-1065G7).
+     *
+     * See https://godbolt.org/z/ebv131Wrh
+     */
+    unsigned s = ((c - 'a') ^ (c - ('z' + 1))) & 0x100;
+    return c & ~(s >> 3);
+}
+
+static inline
+int MemfsWcsnicmp(const wchar_t *s0, const wchar_t *t0, int n)
+{
+    /* Use fast loop for ASCII and fall back to CompareStringW for general case. */
+    const wchar_t *s = s0;
+    const wchar_t *t = t0;
+    int v = 0;
+    for (const void *e = t + n; e > (const void *)t; ++s, ++t)
+    {
+        unsigned sc = *s, tc = *t;
+        if (0xffffff80 & (sc | tc))
+        {
+            v = CompareStringW(LOCALE_INVARIANT, NORM_IGNORECASE, s0, n, t0, n);
+            if (0 != v)
+                return v - 2;
+            else
+                return _wcsnicmp(s, t, n);
+        }
+        if (0 != (v = MemfsUpperChar(sc) - MemfsUpperChar(tc)) || !tc)
+            break;
+    }
+    return v;/*(0 < v) - (0 > v);*/
+}
+
+static inline
 int MemfsFileNameCompare(PWSTR a, int alen, PWSTR b, int blen, BOOLEAN CaseInsensitive)
 {
     PWSTR p, endp, partp, q, endq, partq;
@@ -226,13 +276,7 @@ int MemfsFileNameCompare(PWSTR a, int alen, PWSTR b, int blen, BOOLEAN CaseInsen
         len = plen < qlen ? plen : qlen;
 
         if (CaseInsensitive)
-        {
-            res = CompareStringW(LOCALE_INVARIANT, NORM_IGNORECASE, partp, plen, partq, qlen);
-            if (0 != res)
-                res -= 2;
-            else
-                res = _wcsnicmp(partp, partq, len);
-        }
+            res = MemfsWcsnicmp(partp, partq, len);
         else
             res = wcsncmp(partp, partq, len);
 
@@ -1298,8 +1342,7 @@ static NTSTATUS Overwrite(FSP_FILE_SYSTEM *FileSystem,
         MemfsFileNodeMapEnumerateFn, &Context);
     for (Index = 0; Context.Count > Index; Index++)
     {
-        LONG RefCount = Context.FileNodes[Index]->RefCount;
-        MemoryBarrier();
+        LONG RefCount = FspInterlockedLoad32((INT32 *)&Context.FileNodes[Index]->RefCount);
         if (2 >= RefCount)
             MemfsFileNodeMapRemove(Memfs->FileNodeMap, Context.FileNodes[Index]);
     }
@@ -2231,6 +2274,14 @@ static NTSTATUS SetEa(FSP_FILE_SYSTEM *FileSystem,
 }
 #endif
 
+#if defined(MEMFS_DISPATCHER_STOPPED)
+static VOID DispatcherStopped(FSP_FILE_SYSTEM *FileSystem,
+    BOOLEAN Normally)
+{
+    FspFileSystemStopServiceIfNecessary(FileSystem, Normally);
+}
+#endif
+
 static FSP_FILE_SYSTEM_INTERFACE MemfsInterface =
 {
     GetVolumeInfo,
@@ -2297,6 +2348,12 @@ static FSP_FILE_SYSTEM_INTERFACE MemfsInterface =
 #else
     0,
     0,
+    0,
+#endif
+    0,
+#if defined(MEMFS_DISPATCHER_STOPPED)
+    DispatcherStopped,
+#else
     0,
 #endif
 };
@@ -2387,6 +2444,7 @@ NTSTATUS MemfsCreateFunnel(
     VolumeParams.NamedStreams = 1;
 #endif
     VolumeParams.PostCleanupWhenModifiedOnly = 1;
+    VolumeParams.PostDispositionWhenNecessaryOnly = 1;
 #if defined(MEMFS_DIRINFO_BY_NAME)
     VolumeParams.PassQueryDirectoryFileName = 1;
 #endif

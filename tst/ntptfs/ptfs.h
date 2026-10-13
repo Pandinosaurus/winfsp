@@ -1,7 +1,7 @@
 /**
  * @file ptfs.h
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -41,18 +41,24 @@ enum
     PtfsReparsePoints = 0x00000010,
     PtfsNamedStreams = 0x00000040,
     PtfsExtendedAttributes = 0x00000100,
+    PtfsWslFeatures = 0x04000000,
     PtfsFlushAndPurgeOnCleanup = 0x00004000,
+    PtfsSetAllocationSizeOnCleanup = 0x00010000,                // reuse UmFileContextIsUserContext2
     PtfsAttributesMask =
         PtfsReparsePoints |
         PtfsNamedStreams |
         PtfsExtendedAttributes |
-        PtfsFlushAndPurgeOnCleanup,
+        PtfsWslFeatures |
+        PtfsFlushAndPurgeOnCleanup |
+        PtfsSetAllocationSizeOnCleanup,
 };
 typedef struct
 {
     FSP_FILE_SYSTEM *FileSystem;
+    BOOLEAN HasSecurityPrivilege;
     HANDLE RootHandle;
     ULONG RootPrefixLength;
+    ULONG FsAttributeMask;
     ULONG FsAttributes;
     UINT64 AllocationUnit;
 } PTFS;
@@ -122,6 +128,11 @@ NTSTATUS LfsFsControlFile(
     PVOID OutputBuffer,
     ULONG OutputBufferLength,
     PULONG PBytesTransferred);
+static inline
+ULONG LfsGetEaSize(ULONG EaSize)
+{
+    return 0 != EaSize ? EaSize - 4 : 0;
+}
 
 
 /*

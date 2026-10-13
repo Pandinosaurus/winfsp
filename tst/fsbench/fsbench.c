@@ -1,7 +1,7 @@
 /**
  * @file fsbench.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -23,7 +23,10 @@
 #include <strsafe.h>
 #include <tlib/testsuite.h>
 
+static BOOLEAN OptEmptyCache = FALSE;
+static CHAR OptEmptyCacheDrive = 0;
 static ULONG OptFileCount = 1000;
+static ULONG OptOpenCount = 10;
 static ULONG OptListCount = 100;
 static ULONG OptRdwrFileSize = 4096 * 1024;
 static ULONG OptRdwrCcCount = 100;
@@ -31,43 +34,44 @@ static ULONG OptRdwrNcCount = 100;
 static ULONG OptMmapFileSize = 4096 * 1024;
 static ULONG OptMmapCount = 100;
 
-static void file_create_dotest(ULONG CreateDisposition)
+static void file_create_dotest(ULONG CreateDisposition, ULONG OpenCount)
 {
     HANDLE Handle;
     BOOL Success;
     WCHAR FileName[MAX_PATH];
 
-    for (ULONG Index = 0; OptFileCount > Index; Index++)
-    {
-        StringCbPrintfW(FileName, sizeof FileName, L"fsbench-file%lu", Index);
-        Handle = CreateFileW(FileName,
-            GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-            0,
-            CreateDisposition, FILE_ATTRIBUTE_NORMAL,
-            0);
-        ASSERT(INVALID_HANDLE_VALUE != Handle);
-        Success = CloseHandle(Handle);
-        ASSERT(Success);
-    }
+    for (ULONG OpenIndex = 0; OpenCount > OpenIndex; OpenIndex++)
+        for (ULONG Index = 0; OptFileCount > Index; Index++)
+        {
+            StringCbPrintfW(FileName, sizeof FileName, L"fsbench-file%lu", Index);
+            Handle = CreateFileW(FileName,
+                GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                0,
+                CreateDisposition, FILE_ATTRIBUTE_NORMAL,
+                0);
+            ASSERT(INVALID_HANDLE_VALUE != Handle);
+            Success = CloseHandle(Handle);
+            ASSERT(Success);
+        }
 }
 static void file_create_test(void)
 {
-    file_create_dotest(CREATE_NEW);
+    file_create_dotest(CREATE_NEW, 1);
 }
 static void file_open_test(void)
 {
-    file_create_dotest(OPEN_EXISTING);
+    file_create_dotest(OPEN_EXISTING, OptOpenCount);
 }
 static void file_overwrite_test(void)
 {
-    file_create_dotest(CREATE_ALWAYS);
+    file_create_dotest(CREATE_ALWAYS, 1);
 }
 static void file_attr_test(void)
 {
     WCHAR FileName[MAX_PATH];
     DWORD FileAttributes;
 
-    for (ULONG ListIndex = 0; OptListCount > ListIndex; ListIndex++)
+    for (ULONG OpenIndex = 0; OptOpenCount > OpenIndex; OpenIndex++)
         for (ULONG Index = 0; OptFileCount > Index; Index++)
         {
             StringCbPrintfW(FileName, sizeof FileName, L"fsbench-file%lu", Index);
@@ -99,7 +103,7 @@ static void file_list_single_test(void)
     WCHAR FileName[MAX_PATH];
     WIN32_FIND_DATAW FindData;
 
-    for (ULONG ListIndex = 0; OptListCount > ListIndex; ListIndex++)
+    for (ULONG OpenIndex = 0; OptOpenCount > OpenIndex; OpenIndex++)
         for (ULONG Index = 0; OptFileCount > Index; Index++)
         {
             StringCbPrintfW(FileName, sizeof FileName, L"fsbench-file%lu", Index);
@@ -118,7 +122,7 @@ static void file_list_none_test(void)
     WCHAR FileName[MAX_PATH];
     WIN32_FIND_DATAW FindData;
 
-    for (ULONG ListIndex = 0; OptListCount > ListIndex; ListIndex++)
+    for (ULONG OpenIndex = 0; OptOpenCount > OpenIndex; OpenIndex++)
         for (ULONG Index = 0; OptFileCount > Index; Index++)
         {
             StringCbPrintfW(FileName, sizeof FileName, L"{5F849D7F-73AF-49AC-B7C3-657B36EAD5C4}");
@@ -398,6 +402,75 @@ static void mmap_tests(void)
     TEST(mmap_read_test);
 }
 
+static void EmptyCache(const char *name, void (*fn)(void), int v)
+{
+    NTSYSCALLAPI NTSTATUS NTAPI
+    NtSetSystemInformation(
+        ULONG SystemInformationClass,
+        PVOID SystemInformation,
+        ULONG SystemInformationLength);
+
+    if (+1 == v) /* setup */
+    {
+        /* flush the file system cache (requires SE_INCREASE_QUOTA_NAME) */
+        ASSERT(SetSystemFileCacheSize((SIZE_T)-1, (SIZE_T)-1, 0));
+
+        /* flush/purge the standby list (requires SE_PROF_SINGLE_PROCESS_NAME) */
+        ULONG Command;
+        Command = 3 /*MemoryFlushModifiedList*/;
+        ASSERT(0 == NtSetSystemInformation(80 /*SystemMemoryListInformation*/, &Command, sizeof Command));
+        Command = 4 /*MemoryPurgeStandbyList*/;
+        ASSERT(0 == NtSetSystemInformation(80 /*SystemMemoryListInformation*/, &Command, sizeof Command));
+
+        /* optionally invalidate the volume cache; see https://stackoverflow.com/a/7701908/568557 */
+        if (OptEmptyCacheDrive)
+        {
+            WCHAR VolumeNameBuf[] = L"\\\\.\\X:";
+            HANDLE VolumeHandle;
+            VolumeNameBuf[4] = OptEmptyCacheDrive;
+            VolumeHandle = CreateFileW(VolumeNameBuf, FILE_READ_DATA, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+            if (INVALID_HANDLE_VALUE != VolumeHandle)
+                CloseHandle(VolumeHandle);
+        }
+    }
+    else
+    if (-1 == v) /* teardown */
+    {
+    }
+}
+static DWORD EnablePrivilegesForEmptyCache(VOID)
+{
+    union
+    {
+        TOKEN_PRIVILEGES P;
+        UINT8 B[sizeof(TOKEN_PRIVILEGES) + sizeof(LUID_AND_ATTRIBUTES)];
+    } Privileges;
+    HANDLE Token;
+
+    Privileges.P.PrivilegeCount = 2;
+    Privileges.P.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    Privileges.P.Privileges[1].Attributes = SE_PRIVILEGE_ENABLED;
+
+    if (!LookupPrivilegeValueW(0, SE_PROF_SINGLE_PROCESS_NAME, &Privileges.P.Privileges[0].Luid) ||
+        !LookupPrivilegeValueW(0, SE_INCREASE_QUOTA_NAME, &Privileges.P.Privileges[1].Luid))
+        return GetLastError();
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &Token))
+        return GetLastError();
+
+    if (!AdjustTokenPrivileges(Token, FALSE, &Privileges.P, 0, 0, 0) ||
+        ERROR_NOT_ALL_ASSIGNED == GetLastError())
+    {
+        CloseHandle(Token);
+
+        return GetLastError();
+    }
+
+    CloseHandle(Token);
+
+    return ERROR_SUCCESS;
+}
+
 #define rmarg(argv, argc, argi)         \
     argc--,                             \
     memmove(argv + argi, argv + argi + 1, (argc - argi) * sizeof(char *)),\
@@ -414,9 +487,25 @@ int main(int argc, char *argv[])
         const char *a = argv[argi];
         if ('-' == a[0])
         {
-            if (0 == strncmp("--files=", a, sizeof "--files=" - 1))
+            if (0 == strcmp("--empty-cache", a))
+            {
+                OptEmptyCache = TRUE;
+                rmarg(argv, argc, argi);
+            }
+            else if (0 == strncmp("--empty-cache=", a, sizeof "--empty-cache=" - 1))
+            {
+                OptEmptyCache = TRUE;
+                OptEmptyCacheDrive = *(a + sizeof "--empty-cache=" - 1);
+                rmarg(argv, argc, argi);
+            }
+            else if (0 == strncmp("--files=", a, sizeof "--files=" - 1))
             {
                 OptFileCount = strtoul(a + sizeof "--files=" - 1, 0, 10);
+                rmarg(argv, argc, argi);
+            }
+            else if (0 == strncmp("--open=", a, sizeof "--open=" - 1))
+            {
+                OptOpenCount = strtoul(a + sizeof "--open=" - 1, 0, 10);
                 rmarg(argv, argc, argi);
             }
             else if (0 == strncmp("--list=", a, sizeof "--list=" - 1))
@@ -440,6 +529,16 @@ int main(int argc, char *argv[])
                 rmarg(argv, argc, argi);
             }
         }
+    }
+
+    if (OptEmptyCache)
+    {
+        if (0 != EnablePrivilegesForEmptyCache())
+        {
+            tlib_printf("ABORT: cannot enable privileges required for empty cache\n");
+            abort();
+        }
+        TESTHOOK(EmptyCache);
     }
 
     tlib_run_tests(argc, argv);

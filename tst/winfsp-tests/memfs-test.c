@@ -1,7 +1,7 @@
 /**
  * @file memfs-test.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -48,9 +48,9 @@ void *memfs_start_ex(ULONG Flags, ULONG FileInfoTimeout)
         FileInfoTimeout,
         1024,
         1024 * 1024,
-        50, /*SlowioMaxDelay*/
-        10, /*SlowioPercentDelay*/
-        5,  /*SlowioRarefyDelay*/
+        (Flags & MemfsNoSlowio) ? 0 : 50, /*SlowioMaxDelay*/
+        (Flags & MemfsNoSlowio) ? 0 : 10, /*SlowioPercentDelay*/
+        (Flags & MemfsNoSlowio) ? 0 : 5,  /*SlowioRarefyDelay*/
         0,
         MemfsNet == Flags ? L"\\memfs\\share" : 0,
         0,
@@ -65,6 +65,9 @@ void *memfs_start_ex(ULONG Flags, ULONG FileInfoTimeout)
     }
 
     Result = MemfsStart(Memfs);
+    ASSERT(NT_SUCCESS(Result));
+
+    Result = FspFsctlTransact(MemfsFileSystem(Memfs)->VolumeHandle, 0, 0, 0, 0, FALSE);
     ASSERT(NT_SUCCESS(Result));
 
     memfs_running = 1;

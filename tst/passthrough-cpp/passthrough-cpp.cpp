@@ -1,7 +1,7 @@
 /**
  * @file passthrough-cpp.cpp
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -191,7 +191,7 @@ Ptfs::~Ptfs()
 
 NTSTATUS Ptfs::SetPath(PWSTR Path)
 {
-    WCHAR FullPath[MAX_PATH];
+    WCHAR FullPath[FULLPATH_SIZE];
     ULONG Length;
     HANDLE Handle;
     FILETIME CreationTime;

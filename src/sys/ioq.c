@@ -1,7 +1,7 @@
 /**
  * @file sys/ioq.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -152,6 +152,7 @@
 #define FspIoqEventSet(E)               KeSetEvent(E, 1, FALSE)
 #define FspIoqEventCancellableWait(E,T,I)   FsRtlCancellableWaitForSingleObject(E,T,I)
 #define FspIoqEventClear(E)             KeClearEvent(E)
+#error FsRtlCancellableWaitForSingleObject needs to support FSRTL_FAST_IO_TOP_LEVEL_IRP cancellation
 #endif
 
 /*

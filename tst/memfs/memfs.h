@@ -1,7 +1,7 @@
 /**
  * @file memfs.h
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -38,6 +38,7 @@ enum
     MemfsCaseInsensitive                = 0x80000000,
     MemfsFlushAndPurgeOnCleanup         = 0x40000000,
     MemfsLegacyUnlinkRename             = 0x20000000,
+    MemfsNoSlowio                       = 0x10000000,
 };
 
 #define MemfsCreate(Flags, FileInfoTimeout, MaxFileNodes, MaxFileSize, VolumePrefix, RootSddl, PMemfs)\

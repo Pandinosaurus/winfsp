@@ -6,8 +6,8 @@ setlocal EnableDelayedExpansion
 call "%~dp0myinfo.bat"
 
 set MsiName="%MyProductName% - %MyDescription%"
-set CrossCert="%~dp0DigiCert High Assurance EV Root CA.crt"
-set Issuer="DigiCert"
+set CrossCert="%~dp0%MyCrossCert%"
+set Issuer="%MyCertIssuer%"
 set Subject="%MyCompanyName%"
 
 set Configuration=Release
@@ -26,9 +26,18 @@ if X%~nx0==Xbuild-choco.bat (
 
 set BuildArm64=yes
 if "%APPVEYOR_BUILD_WORKER_IMAGE%"=="Visual Studio 2015" (
-    echo WARNING: APPVEYOR BUILD ON UNSUPPORTED VERSION OF VISUAL STUDIO.
-    echo:
     set BuildArm64=no
+    set UseDotnetSdk=yes
+    set FixWindowsSdk=yes
+)
+if "%APPVEYOR_BUILD_WORKER_IMAGE%"=="Visual Studio 2017" (
+    set BuildArm64=no
+    set FixWindowsSdk=yes
+)
+if X%BuildArm64%==Xno (
+    echo WARNING: APPVEYOR BUILD ON UNSUPPORTED VERSION OF VISUAL STUDIO.
+    echo WARNING: ARM64 BUILD PRODUCTS ARE COPIES OF X64 BUILD PRODUCTS.
+    echo:
 )
 
 call "%~dp0vcvarsall.bat" x64
@@ -36,8 +45,11 @@ call "%~dp0vcvarsall.bat" x64
 if not X%SignedPackage%==X (
     if not exist "%~dp0..\build\VStudio\build\%Configuration%\%MyProductFileName%-*.msi" (echo previous build not found >&2 & exit /b 1)
     if not exist "%SignedPackage%" (echo signed package not found >&2 & exit /b 1)
+    set Version=
+    for %%f in (build\%Configuration%\%MyProductFileName%-*.msi) do set Version=%%~nf
+    set Version=!Version:%MyProductFileName%-=!
     del "%~dp0..\build\VStudio\build\%Configuration%\%MyProductFileName%-*.msi"
-    if exist "%~dp0..\build\VStudio\build\%Configuration%\winfsp.*.nupkg" del "%~dp0..\build\VStudio\build\%Configuration%\winfsp.*.nupkg"
+    if exist "%~dp0..\build\VStudio\build\%Configuration%\winfsp.!Version!.nupkg" del "%~dp0..\build\VStudio\build\%Configuration%\winfsp.!Version!.nupkg"
     for /R "%SignedPackage%" %%f in (*.sys) do (
         copy "%%f" "%~dp0..\build\VStudio\build\%Configuration%" >nul
     )
@@ -51,6 +63,11 @@ if X%SignedPackage%==X (
         if exist "%%d" rmdir /s/q "%%d"
     )
 
+    if X%FixWindowsSdk%==Xyes (
+        powershell -command "($xml=[xml](Get-Content 'build.version.props')).Project.PropertyGroup.MyTargetPlatformVersion='$(LatestTargetPlatformVersion)'; $xml.Save('build.version.props')"
+        if errorlevel 1 goto fail
+    )
+
     if X%BuildArm64%==Xyes (
         devenv winfsp.sln /build "%Configuration%|ARM64"
         if errorlevel 1 goto fail
@@ -60,21 +77,38 @@ if X%SignedPackage%==X (
     devenv winfsp.sln /build "%Configuration%|x86"
     if errorlevel 1 goto fail
     if X%BuildArm64%==Xno (
-        echo:
-        echo WARNING: APPVEYOR BUILD ON UNSUPPORTED VERSION OF VISUAL STUDIO.
-        echo WARNING: ARM64 BUILD PRODUCTS ARE COPIES OF X64 BUILD PRODUCTS.
-        echo:
         copy build\%Configuration%\*-x64.* build\%Configuration%\*-a64.* >nul
+        if errorlevel 1 goto fail
     )
 
-    for %%f in (build\%Configuration%\%MyProductFileName%-a64.sys build\%Configuration%\%MyProductFileName%-x64.sys build\%Configuration%\%MyProductFileName%-x86.sys) do (
-        signtool sign /ac %CrossCert% /i %Issuer% /n %Subject% /fd sha1 /t http://timestamp.digicert.com %%f
-        if errorlevel 1 set /a signfail=signfail+1
-        signtool sign /as /ac %CrossCert% /i %Issuer% /n %Subject% /fd sha256 /tr http://timestamp.digicert.com /td sha256 %%f
-        if errorlevel 1 set /a signfail=signfail+1
+    if X%UseDotnetSdk%==Xyes (
+        dotnet build ./dotnet/winfsp.net.csproj -c "%Configuration%" -p:Platform=AnyCPU -p:SolutionDir="%cd%"\
+        if errorlevel 1 goto fail
+        dotnet build ./testing/memfs-dotnet.csproj -c "%Configuration%" -p:Platform=AnyCPU -p:SolutionDir="%cd%"\
+        if errorlevel 1 goto fail
     )
 
     pushd build\%Configuration%
+    set signfiles=^
+        %MyProductFileName%-a64.sys %MyProductFileName%-x64.sys %MyProductFileName%-x86.sys^
+        %MyProductFileName%-a64.dll %MyProductFileName%-x64.dll %MyProductFileName%-x86.dll %MyProductFileName%-msil.dll^
+        launcher-a64.exe launcher-x64.exe launcher-x86.exe^
+        launchctl-a64.exe launchctl-x64.exe launchctl-x86.exe^
+        fsptool-a64.exe fsptool-x64.exe fsptool-x86.exe^
+        memfs-a64.exe memfs-x64.exe memfs-x86.exe memfs-dotnet-msil.exe
+    signtool sign /ac %CrossCert% /i %Issuer% /n %Subject% /fd sha256 /tr http://timestamp.digicert.com /td sha256 !signfiles!
+    if errorlevel 1 set /a signfail=signfail+1
+    popd
+
+    pushd build\%Configuration%
+    mkdir unsigned
+    for %%f in (!signfiles!) do (
+        copy "%%f" unsigned >nul
+    )
+    pushd unsigned
+    signtool remove /q /s !signfiles!
+    if errorlevel 1 set /a signfail=signfail+1
+    popd
     echo .OPTION EXPLICIT >driver.ddf
     echo .Set CabinetFileCountThreshold=0 >>driver.ddf
     echo .Set FolderFileCountThreshold=0 >>driver.ddf
@@ -89,13 +123,13 @@ if X%SignedPackage%==X (
     echo .Set DiskDirectory1=. >>driver.ddf
     echo .Set DestinationDir=a64 >>driver.ddf
     echo driver-a64.inf >>driver.ddf
-    echo %MyProductFileName%-a64.sys >>driver.ddf
+    echo unsigned\%MyProductFileName%-a64.sys >>driver.ddf
     echo .Set DestinationDir=x64 >>driver.ddf
     echo driver-x64.inf >>driver.ddf
-    echo %MyProductFileName%-x64.sys >>driver.ddf
+    echo unsigned\%MyProductFileName%-x64.sys >>driver.ddf
     echo .Set DestinationDir=x86 >>driver.ddf
     echo driver-x86.inf >>driver.ddf
-    echo %MyProductFileName%-x86.sys >>driver.ddf
+    echo unsigned\%MyProductFileName%-x86.sys >>driver.ddf
     makecab /F driver.ddf
     signtool sign /ac %CrossCert% /i %Issuer% /n %Subject% /fd sha256 /tr http://timestamp.digicert.com /td sha256 driver.cab
     if errorlevel 1 set /a signfail=signfail+1
@@ -106,10 +140,8 @@ devenv winfsp.sln /build "Installer.%Configuration%|x86"
 if errorlevel 1 goto fail
 
 for %%f in (build\%Configuration%\%MyProductFileName%-*.msi) do (
-    signtool sign /ac %CrossCert% /i %Issuer% /n %Subject% /fd sha1 /t http://timestamp.digicert.com /d %MsiName% %%f
+    signtool sign /ac %CrossCert% /i %Issuer% /n %Subject% /fd sha256 /tr http://timestamp.digicert.com /td sha256 /d %MsiName% %%f
     if errorlevel 1 set /a signfail=signfail+1
-    REM signtool sign /ac %CrossCert% /i %Issuer% /n %Subject% /fd sha256 /tr http://timestamp.digicert.com /td sha256 /d %MsiName% %%f
-    REM if errorlevel 1 set /a signfail=signfail+1
 )
 
 if not %signfail%==0 echo SIGNING FAILED! The product has been successfully built, but not signed.

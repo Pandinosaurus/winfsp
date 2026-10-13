@@ -11,6 +11,8 @@ jobs:
     - uses: billziss-gh/avm@v1
       with:
         files: |
-            https://github.com/billziss-gh/winfsp/releases/download/v1.6/winfsp-1.6.20027.msi
-            https://github.com/billziss-gh/winfsp/releases/download/v1.7B1/winfsp-1.7.20038.msi
-            https://github.com/billziss-gh/winfsp/releases/download/v1.8/winfsp-1.8.20304.msi
+            https://github.com/winfsp/winfsp/releases/download/v1.10/winfsp-1.10.22006.msi
+            https://github.com/winfsp/winfsp/releases/download/v1.11/winfsp-1.11.22176.msi
+            https://github.com/winfsp/winfsp/releases/download/v1.12/winfsp-1.12.22301.msi
+            https://github.com/winfsp/winfsp/releases/download/v1.12.22339/winfsp-1.12.22339.msi
+            https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi

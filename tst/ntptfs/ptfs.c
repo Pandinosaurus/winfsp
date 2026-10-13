@@ -1,7 +1,7 @@
 /**
  * @file ptfs.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -24,12 +24,14 @@
 #define FileSystemContext               ((PTFS *)(FileSystem)->UserContext)
 #define FileContextHandle               (((FILE_CONTEXT *)(FileContext))->Handle)
 #define FileContextIsDirectory          (((FILE_CONTEXT *)(FileContext))->IsDirectory)
+#define FileContextDirFileSize          (((FILE_CONTEXT *)(FileContext))->DirFileSize)
 #define FileContextDirBuffer            (&((FILE_CONTEXT *)(FileContext))->DirBuffer)
 
 typedef struct
 {
     HANDLE Handle;
     BOOLEAN IsDirectory;
+    ULONG DirFileSize;
     PVOID DirBuffer;
 } FILE_CONTEXT;
 
@@ -92,7 +94,8 @@ static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *FileSystem,
 
     Result = LfsOpenFile(
         &Handle,
-        READ_CONTROL,
+        READ_CONTROL |
+            (Ptfs->HasSecurityPrivilege ? ACCESS_SYSTEM_SECURITY : 0),
         Ptfs->RootHandle,
         FileName,
         FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT);
@@ -121,7 +124,8 @@ static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *FileSystem,
     {
         Result = NtQuerySecurityObject(
             Handle,
-            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                (Ptfs->HasSecurityPrivilege ? SACL_SECURITY_INFORMATION : 0),
             SecurityDescriptor,
             (ULONG)*PSecurityDescriptorSize,
             &SecurityDescriptorSizeNeeded);
@@ -153,21 +157,32 @@ static NTSTATUS CreateEx(FSP_FILE_SYSTEM *FileSystem,
     UINT32 MaximumAccess = IsDirectory ? GrantedAccess : MAXIMUM_ALLOWED;
     NTSTATUS Result;
 
-    if (ExtraBufferIsReparsePoint)
-    {
-        /* no support for WSL */
-        Result = STATUS_INVALID_PARAMETER;
-        goto exit;
-    }
-
     CreateOptions &=
         FILE_DIRECTORY_FILE |
         FILE_NON_DIRECTORY_FILE |
         FILE_NO_EA_KNOWLEDGE;
 
+    /* WORKAROUND:
+     *
+     * WOW64 appears to have a bug in some versions of the OS (seen on Win10 1909 and
+     * Server 2012 R2), where NtQueryDirectoryFile may produce garbage if called on a
+     * directory that has been opened without FILE_SYNCHRONOUS_IO_NONALERT. (Garbage:
+     * after a STATUS_PENDING has been waited, Iosb.Information reports bytes transferred
+     * but the buffer does not get filled).
+     *
+     * So make sure to always open directories in a synchronous manner.
+     */
+    if (IsDirectory)
+    {
+        MaximumAccess |= SYNCHRONIZE;
+        //GrantedAccess |= SYNCHRONIZE;
+        CreateOptions |= FILE_SYNCHRONOUS_IO_NONALERT;
+    }
+
     Result = LfsCreateFile(
         &Handle,
-        MaximumAccess,
+        MaximumAccess |
+            (Ptfs->HasSecurityPrivilege ? ACCESS_SYSTEM_SECURITY : 0),
         Ptfs->RootHandle,
         FileName,
         SecurityDescriptor,
@@ -183,7 +198,8 @@ static NTSTATUS CreateEx(FSP_FILE_SYSTEM *FileSystem,
         case STATUS_INVALID_PARAMETER:
             Result = LfsCreateFile(
                 &Handle,
-                GrantedAccess,
+                GrantedAccess |
+                    (Ptfs->HasSecurityPrivilege ? ACCESS_SYSTEM_SECURITY : 0),
                 Ptfs->RootHandle,
                 FileName,
                 SecurityDescriptor,
@@ -197,6 +213,21 @@ static NTSTATUS CreateEx(FSP_FILE_SYSTEM *FileSystem,
         }
     if (!NT_SUCCESS(Result))
         goto exit;
+
+    if (ExtraBufferIsReparsePoint)
+    {
+        /* this can happen on a WSL mount */
+        Result = LfsFsControlFile(
+            Handle,
+            FSCTL_SET_REPARSE_POINT,
+            ExtraBuffer,
+            (ULONG)ExtraLength,
+            0,
+            0,
+            &ExtraLength);
+        if (!NT_SUCCESS(Result))
+            goto exit;
+    }
 
     Result = LfsGetFileInfo(Handle, Ptfs->RootPrefixLength, FileInfo);
     if (!NT_SUCCESS(Result))
@@ -212,6 +243,7 @@ static NTSTATUS CreateEx(FSP_FILE_SYSTEM *FileSystem,
     memset(FileContext, 0, sizeof *FileContext);
     FileContext->Handle = Handle;
     FileContext->IsDirectory = IsDirectory;
+    FileContext->DirFileSize = (ULONG)FileInfo->FileSize;
     *PFileContext = FileContext;
 
     Result = STATUS_SUCCESS;
@@ -245,9 +277,27 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem,
         FILE_NON_DIRECTORY_FILE |
         FILE_NO_EA_KNOWLEDGE;
 
+    /* WORKAROUND:
+     *
+     * WOW64 appears to have a bug in some versions of the OS (seen on Win10 1909 and
+     * Server 2012 R2), where NtQueryDirectoryFile may produce garbage if called on a
+     * directory that has been opened without FILE_SYNCHRONOUS_IO_NONALERT. (Garbage:
+     * after a STATUS_PENDING has been waited, Iosb.Information reports bytes transferred
+     * but the buffer does not get filled).
+     *
+     * So make sure to always open directories in a synchronous manner.
+     */
+    if (IsDirectory)
+    {
+        MaximumAccess |= SYNCHRONIZE;
+        //GrantedAccess |= SYNCHRONIZE;
+        CreateOptions |= FILE_SYNCHRONOUS_IO_NONALERT;
+    }
+
     Result = LfsOpenFile(
         &Handle,
-        MaximumAccess,
+        MaximumAccess |
+            (Ptfs->HasSecurityPrivilege ? ACCESS_SYSTEM_SECURITY : 0),
         Ptfs->RootHandle,
         FileName,
         FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT | CreateOptions);
@@ -260,7 +310,8 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem,
         case STATUS_INVALID_PARAMETER:
             Result = LfsOpenFile(
                 &Handle,
-                GrantedAccess,
+                GrantedAccess |
+                    (Ptfs->HasSecurityPrivilege ? ACCESS_SYSTEM_SECURITY : 0),
                 Ptfs->RootHandle,
                 FileName,
                 FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT | CreateOptions);
@@ -283,6 +334,7 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem,
     memset(FileContext, 0, sizeof *FileContext);
     FileContext->Handle = Handle;
     FileContext->IsDirectory = IsDirectory;
+    FileContext->DirFileSize = (ULONG)FileInfo->FileSize;
     *PFileContext = FileContext;
 
     Result = STATUS_SUCCESS;
@@ -335,6 +387,7 @@ exit:
 static VOID Cleanup(FSP_FILE_SYSTEM *FileSystem,
     PVOID FileContext, PWSTR FileName, ULONG Flags)
 {
+    PTFS *Ptfs = FileSystemContext;
     HANDLE Handle = FileContextHandle;
 
     if (Flags & FspCleanupDelete)
@@ -344,6 +397,32 @@ static VOID Cleanup(FSP_FILE_SYSTEM *FileSystem,
 
         /* this will make all future uses of Handle to fail with STATUS_INVALID_HANDLE */
         FileContextHandle = 0;
+    }
+    else if ((Flags & FspCleanupSetAllocationSize) &&
+        (Ptfs->FsAttributeMask & PtfsSetAllocationSizeOnCleanup))
+    {
+        IO_STATUS_BLOCK Iosb;
+        FILE_STANDARD_INFORMATION FileStdInfo;
+        FILE_ALLOCATION_INFORMATION FileAllocInfo;
+        NTSTATUS Result;
+
+        Result = NtQueryInformationFile(
+            Handle,
+            &Iosb,
+            &FileStdInfo,
+            sizeof FileStdInfo,
+            5/*FileStandardInformation*/);
+        if (NT_SUCCESS(Result))
+        {
+            FileAllocInfo.AllocationSize.QuadPart = FileStdInfo.EndOfFile.QuadPart;
+
+            Result = NtSetInformationFile(
+                Handle,
+                &Iosb,
+                &FileAllocInfo,
+                sizeof FileAllocInfo,
+                19/*FileAllocationInformation*/);
+        }
     }
 }
 
@@ -619,13 +698,15 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *FileSystem,
         65/*FileRenameInformationEx*/);
     if (!NT_SUCCESS(Result))
     {
-        if (STATUS_OBJECT_NAME_COLLISION == Result && ReplaceIfExists && !PosixReplaceIfExists)
+        switch (Result)
         {
-            Result = STATUS_ACCESS_DENIED;
+        case STATUS_OBJECT_NAME_COLLISION:
+            if (ReplaceIfExists && !PosixReplaceIfExists)
+                Result = STATUS_ACCESS_DENIED;
+            goto exit;
+        case STATUS_ACCESS_DENIED:
             goto exit;
         }
-        if (STATUS_INVALID_PARAMETER != Result)
-            goto exit;
 
         FileRenInfo.V.Flags = 0;
         FileRenInfo.V.ReplaceIfExists = ReplaceIfExists;
@@ -650,13 +731,15 @@ static NTSTATUS GetSecurity(FSP_FILE_SYSTEM *FileSystem,
     PVOID FileContext,
     PSECURITY_DESCRIPTOR SecurityDescriptor, SIZE_T *PSecurityDescriptorSize)
 {
+    PTFS *Ptfs = FileSystemContext;
     HANDLE Handle = FileContextHandle;
     ULONG SecurityDescriptorSizeNeeded;
     NTSTATUS Result;
 
     Result = NtQuerySecurityObject(
         Handle,
-        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+            (Ptfs->HasSecurityPrivilege ? SACL_SECURITY_INFORMATION : 0),
         SecurityDescriptor,
         (ULONG)*PSecurityDescriptorSize,
         &SecurityDescriptorSizeNeeded);
@@ -699,7 +782,7 @@ static inline VOID CopyQueryInfoToDirInfo(
     DirInfo->FileInfo.IndexNumber = QueryInfo->FileId.QuadPart;
     DirInfo->FileInfo.HardLinks = 0;
     DirInfo->FileInfo.EaSize = 0 != (FILE_ATTRIBUTE_REPARSE_POINT & QueryInfo->FileAttributes) ?
-        0 : QueryInfo->EaSize;
+        0 : LfsGetEaSize(QueryInfo->EaSize);
 }
 
 static NTSTATUS BufferedReadDirectory(FSP_FILE_SYSTEM *FileSystem,
@@ -708,6 +791,18 @@ static NTSTATUS BufferedReadDirectory(FSP_FILE_SYSTEM *FileSystem,
 {
     PTFS *Ptfs = FileSystemContext;
     HANDLE Handle = FileContextHandle;
+    ULONG CapacityHint = FileContextDirFileSize;
+        /*
+         * An analysis of the relationship between the required buffer capacity and the
+         * NTFS directory size (as reported by FileStandardInformation) showed the ratio
+         * between the two to be between 0.5 and 1 with some outliers outside those bounds.
+         * (For this analysis file names of average length of 4 or 24 were used and NTFS
+         * had 8.3 file names disabled.)
+         *
+         * We use the NTFS directory size as our capacity hint (i.e. ratio of 1), which
+         * means that we may overestimate the required buffer capacity in most cases.
+         * This is ok since our goal is to improve performance.
+         */
     PVOID PDirBuffer = FileContextDirBuffer;
     BOOLEAN RestartScan;
     ULONG BytesTransferred;
@@ -722,7 +817,7 @@ static NTSTATUS BufferedReadDirectory(FSP_FILE_SYSTEM *FileSystem,
     NTSTATUS Result, DirBufferResult;
 
     DirBufferResult = STATUS_SUCCESS;
-    if (FspFileSystemAcquireDirectoryBuffer(PDirBuffer, 0 == Marker, &DirBufferResult))
+    if (FspFileSystemAcquireDirectoryBufferEx(PDirBuffer, 0 == Marker, CapacityHint, &DirBufferResult))
     {
         for (RestartScan = TRUE;; RestartScan = FALSE)
         {
@@ -742,6 +837,10 @@ static NTSTATUS BufferedReadDirectory(FSP_FILE_SYSTEM *FileSystem,
                 ;
                 QueryInfo = (FILE_ID_BOTH_DIR_INFORMATION *)((PUINT8)QueryInfo + QueryNext))
             {
+                if (QueryBuffer + BytesTransferred <
+                    (PUINT8)QueryInfo + FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName))
+                    goto done;
+
                 QueryNext = QueryInfo->NextEntryOffset;
 
                 CopyQueryInfoToDirInfo(QueryInfo, &DirInfo.V);
@@ -948,7 +1047,8 @@ static NTSTATUS GetStreamInfo(FSP_FILE_SYSTEM *FileSystem,
         ;
         QueryInfo = (FILE_STREAM_INFORMATION *)((PUINT8)QueryInfo + QueryNext))
     {
-        if (Iosb.Information <= (ULONG)((PUINT8)QueryInfo - QueryBuffer))
+        if (QueryBuffer + Iosb.Information <
+            (PUINT8)QueryInfo + FIELD_OFFSET(FILE_STREAM_INFORMATION, StreamName))
             break;
 
         QueryNext = QueryInfo->NextEntryOffset;
@@ -1027,12 +1127,26 @@ static NTSTATUS SetEa(FSP_FILE_SYSTEM *FileSystem,
 {
     HANDLE Handle = FileContextHandle;
     IO_STATUS_BLOCK Iosb;
+    NTSTATUS Result;
 
-    return NtSetEaFile(
+    Result = NtSetEaFile(
         Handle,
         &Iosb,
         Ea,
         EaLength);
+    if (!NT_SUCCESS(Result))
+        goto exit;
+
+    Result = LfsGetFileInfo(Handle, -1, FileInfo);
+
+exit:
+    return Result;
+}
+
+static VOID DispatcherStopped(FSP_FILE_SYSTEM *FileSystem,
+    BOOLEAN Normally)
+{
+    FspFileSystemStopServiceIfNecessary(FileSystem, Normally);
 }
 
 static FSP_FILE_SYSTEM_INTERFACE PtfsInterface =
@@ -1063,6 +1177,7 @@ static FSP_FILE_SYSTEM_INTERFACE PtfsInterface =
     .GetStreamInfo = GetStreamInfo,
     .GetEa = GetEa,
     .SetEa = SetEa,
+    .DispatcherStopped = DispatcherStopped,
 };
 
 NTSTATUS PtfsCreate(
@@ -1076,6 +1191,9 @@ NTSTATUS PtfsCreate(
 {
     PTFS *Ptfs = 0;
     FSP_FILE_SYSTEM *FileSystem = 0;
+    BOOL HasSecurityPrivilege = FALSE;
+    PRIVILEGE_SET PrivilegeSet;
+    HANDLE ProcessToken;
     HANDLE RootHandle = INVALID_HANDLE_VALUE;
     IO_STATUS_BLOCK Iosb;
     union
@@ -1089,6 +1207,16 @@ NTSTATUS PtfsCreate(
     NTSTATUS Result;
 
     *PPtfs = 0;
+
+    if (LookupPrivilegeValueW(0, SE_SECURITY_NAME, &PrivilegeSet.Privilege[0].Luid) &&
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &ProcessToken))
+    {
+        PrivilegeSet.PrivilegeCount = 1;
+        PrivilegeSet.Control = PRIVILEGE_SET_ALL_NECESSARY;
+        PrivilegeSet.Privilege[0].Attributes = 0;
+        PrivilegeCheck(ProcessToken, &PrivilegeSet, &HasSecurityPrivilege);
+        CloseHandle(ProcessToken);
+    }
 
     RootHandle = CreateFileW(
         RootPath,
@@ -1130,6 +1258,15 @@ NTSTATUS PtfsCreate(
         goto exit;
 
     FsAttributeMask &= PtfsAttributesMask;
+    FsAttrInfo.V.FileSystemAttributes &=
+        FILE_CASE_PRESERVED_NAMES |
+        FILE_UNICODE_ON_DISK |
+        FILE_PERSISTENT_ACLS |
+        ((FsAttributeMask & PtfsReparsePoints) ? FILE_SUPPORTS_REPARSE_POINTS : 0) |
+        ((FsAttributeMask & PtfsNamedStreams) ? FILE_NAMED_STREAMS : 0) |
+        ((FsAttributeMask & PtfsExtendedAttributes) ? FILE_SUPPORTS_EXTENDED_ATTRIBUTES : 0) |
+        0x00000400/*FILE_SUPPORTS_POSIX_UNLINK_RENAME*/ |
+        FILE_READ_ONLY_VOLUME;
 
     memset(&VolumeParams, 0, sizeof VolumeParams);
     VolumeParams.SectorSize = (UINT16)FsSizeInfo.BytesPerSector;
@@ -1142,18 +1279,17 @@ NTSTATUS PtfsCreate(
     VolumeParams.CasePreservedNames = !!(FsAttrInfo.V.FileSystemAttributes & FILE_CASE_PRESERVED_NAMES);
     VolumeParams.UnicodeOnDisk = !!(FsAttrInfo.V.FileSystemAttributes & FILE_UNICODE_ON_DISK);
     VolumeParams.PersistentAcls = !!(FsAttrInfo.V.FileSystemAttributes & FILE_PERSISTENT_ACLS);
-    VolumeParams.ReparsePoints = (FsAttributeMask & PtfsReparsePoints) ?
-        !!(FsAttrInfo.V.FileSystemAttributes & FILE_SUPPORTS_REPARSE_POINTS) : 0;
-    VolumeParams.NamedStreams = (FsAttributeMask & PtfsNamedStreams) ?
-        !!(FsAttrInfo.V.FileSystemAttributes & FILE_NAMED_STREAMS) : 0;
-    VolumeParams.ExtendedAttributes = (FsAttributeMask & PtfsExtendedAttributes) ?
-        !!(FsAttrInfo.V.FileSystemAttributes & FILE_SUPPORTS_EXTENDED_ATTRIBUTES) : 0;
-    VolumeParams.SupportsPosixUnlinkRename = !!(FsAttrInfo.V.FileSystemAttributes & FILE_SUPPORTS_POSIX_UNLINK_RENAME);
+    VolumeParams.ReparsePoints = !!(FsAttrInfo.V.FileSystemAttributes & FILE_SUPPORTS_REPARSE_POINTS);
+    VolumeParams.NamedStreams = !!(FsAttrInfo.V.FileSystemAttributes & FILE_NAMED_STREAMS);
+    VolumeParams.ExtendedAttributes = !!(FsAttrInfo.V.FileSystemAttributes & FILE_SUPPORTS_EXTENDED_ATTRIBUTES);
+    VolumeParams.SupportsPosixUnlinkRename = !!(FsAttrInfo.V.FileSystemAttributes & 0x00000400
+        /*FILE_SUPPORTS_POSIX_UNLINK_RENAME*/);
     VolumeParams.ReadOnlyVolume = !!(FsAttrInfo.V.FileSystemAttributes & FILE_READ_ONLY_VOLUME);
     VolumeParams.PostCleanupWhenModifiedOnly = 1;
+    VolumeParams.PostDispositionWhenNecessaryOnly = 1;
     VolumeParams.PassQueryDirectoryPattern = 1;
-    VolumeParams.FlushAndPurgeOnCleanup = (FsAttributeMask & PtfsFlushAndPurgeOnCleanup) ?
-        1 : 0;
+    VolumeParams.FlushAndPurgeOnCleanup = !!(FsAttributeMask & PtfsFlushAndPurgeOnCleanup);
+    VolumeParams.WslFeatures = !!(FsAttributeMask & PtfsWslFeatures);
     VolumeParams.AllowOpenInKernelMode = 1;
     VolumeParams.RejectIrpPriorToTransact0 = 1;
     VolumeParams.UmFileContextIsUserContext2 = 1;
@@ -1182,8 +1318,10 @@ NTSTATUS PtfsCreate(
     memset(Ptfs, 0, sizeof *Ptfs);
 
     Ptfs->FileSystem = FileSystem;
+    Ptfs->HasSecurityPrivilege = HasSecurityPrivilege;
     Ptfs->RootHandle = RootHandle;
     Ptfs->RootPrefixLength = FileAllInfo.NameInformation.FileNameLength;
+    Ptfs->FsAttributeMask = FsAttributeMask;
     Ptfs->FsAttributes = FsAttrInfo.V.FileSystemAttributes;
     Ptfs->AllocationUnit = VolumeParams.SectorSize * VolumeParams.SectorsPerAllocationUnit;
     FileSystem->UserContext = Ptfs;

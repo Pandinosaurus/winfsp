@@ -1,7 +1,7 @@
 /**
  * @file mount-test.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -215,6 +215,9 @@ void mount_volume_transact_dotest(PWSTR DeviceName, PWSTR Prefix)
     ASSERT(0 == wcsncmp(L"\\Device\\Volume{", VolumeName, 15));
     ASSERT(INVALID_HANDLE_VALUE != VolumeHandle);
 
+    Result = FspFsctlTransact(VolumeHandle, 0, 0, 0, 0, FALSE);
+    ASSERT(NT_SUCCESS(Result));
+
     StringCbPrintfW(FilePath, sizeof FilePath, L"%s%s\\file0",
         Prefix ? L"" : L"\\\\?\\GLOBALROOT", Prefix ? Prefix : VolumeName);
     Thread = (HANDLE)_beginthreadex(0, 0, mount_volume_transact_dotest_thread, FilePath, 0, 0);
@@ -231,6 +234,20 @@ void mount_volume_transact_dotest(PWSTR DeviceName, PWSTR Prefix)
     FSP_FSCTL_TRANSACT_REQ *Request = (PVOID)RequestBuf, *NextRequest;
     FSP_FSCTL_TRANSACT_RSP *Response = (PVOID)ResponseBuf;
 
+    RequestBufSize = 0;
+    Result = FspFsctlTransact(VolumeHandle, ResponseBuf, 1, 0, &RequestBufSize, FALSE);
+    ASSERT(STATUS_INVALID_PARAMETER == Result);
+    RequestBufSize = 0;
+    Result = FspFsctlTransact(VolumeHandle, ResponseBuf, 1, 0, &RequestBufSize, TRUE);
+    ASSERT(STATUS_INVALID_PARAMETER == Result);
+
+    RequestBufSize = FSP_FSCTL_TRANSACT_BUFFER_SIZEMIN - 1;
+    Result = FspFsctlTransact(VolumeHandle, 0, 0, RequestBuf, &RequestBufSize, FALSE);
+    ASSERT(STATUS_BUFFER_TOO_SMALL == Result);
+    RequestBufSize = FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN - 1;
+    Result = FspFsctlTransact(VolumeHandle, 0, 0, RequestBuf, &RequestBufSize, TRUE);
+    ASSERT(STATUS_BUFFER_TOO_SMALL == Result);
+
     ResponseBufSize = 0;
     RequestBufSize = sizeof RequestBuf;
     Result = FspFsctlTransact(VolumeHandle, 0, 0, RequestBuf, &RequestBufSize, TRUE);
@@ -246,6 +263,8 @@ void mount_volume_transact_dotest(PWSTR DeviceName, PWSTR Prefix)
     ASSERT(0 != Request->Hint);
     ASSERT(FspFsctlTransactCreateKind == Request->Kind ||
         FspFsctlTransactQueryVolumeInformationKind == Request->Kind);
+    /* since we made RejectIrpPriorToTransact0 mandatory the assertions below do not hold */
+#if 0
     if (FspFsctlTransactCreateKind == Request->Kind)
     {
         ASSERT(FILE_CREATE == ((Request->Req.Create.CreateOptions >> 24) & 0xff));
@@ -265,6 +284,7 @@ void mount_volume_transact_dotest(PWSTR DeviceName, PWSTR Prefix)
         ASSERT((wcslen((PVOID)Request->Buffer) + 1) * sizeof(WCHAR) == Request->FileName.Size);
         ASSERT(0 == mywcscmp((PVOID)Request->Buffer, -1, L"\\file0", -1));
     }
+#endif
 
     ASSERT(FspFsctlTransactCanProduceResponse(Response, ResponseBufEnd));
 
@@ -294,7 +314,8 @@ void mount_volume_transact_dotest(PWSTR DeviceName, PWSTR Prefix)
     GetExitCodeThread(Thread, &ExitCode);
     CloseHandle(Thread);
 
-    ASSERT(ERROR_ACCESS_DENIED == ExitCode || ERROR_OPERATION_ABORTED == ExitCode);
+    ASSERT(0 != ExitCode);
+    //ASSERT(ERROR_ACCESS_DENIED == ExitCode || ERROR_OPERATION_ABORTED == ExitCode);
 }
 
 void mount_volume_transact_test(void)

@@ -1,7 +1,7 @@
 /**
  * @file winposix.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -129,15 +129,50 @@ char *realpath(const char *path, char *resolved)
         result = resolved;
 
     int err = 0;
-    DWORD len = GetFullPathNameA(path, PATH_MAX, result, 0);
-    if (0 == len)
+    WCHAR PathBuf[PATH_MAX];
+    WCHAR ResultBuf[PATH_MAX];
+    PWSTR ResultBufBgn = &ResultBuf[6];
+    if (0 == MultiByteToWideChar(CP_UTF8, 0, path, -1, PathBuf, PATH_MAX))
         err = GetLastError();
-    else if (PATH_MAX < len)
-        err = ERROR_INVALID_PARAMETER;
+    else
+    {
+        DWORD len = GetFullPathNameW(PathBuf, PATH_MAX - 6, ResultBufBgn, 0);
+        if (0 == len)
+            err = GetLastError();
+        else if (PATH_MAX - 6 < len)
+            err = ERROR_INVALID_PARAMETER;
+        else
+        {
+            if (0 == WideCharToMultiByte(CP_UTF8, 0, ResultBufBgn, -1, result, PATH_MAX, 0, 0))
+                err = GetLastError();
+            else
+            {
+                if (L'\\' == ResultBufBgn[0] && L'\\' == ResultBufBgn[1])
+                {
+                    ResultBufBgn = ResultBuf;
+                    ResultBufBgn[0] = L'\\';
+                    ResultBufBgn[1] = L'\\';
+                    ResultBufBgn[2] = L'?';
+                    ResultBufBgn[3] = L'\\';
+                    ResultBufBgn[4] = L'U';
+                    ResultBufBgn[5] = L'N';
+                    ResultBufBgn[6] = L'C';
+                }
+                else
+                {
+                    ResultBufBgn = &ResultBuf[2];
+                    ResultBufBgn[0] = L'\\';
+                    ResultBufBgn[1] = L'\\';
+                    ResultBufBgn[2] = L'?';
+                    ResultBufBgn[3] = L'\\';
+                }
+            }
+        }
+    }
 
     if (0 == err)
     {
-        HANDLE h = CreateFileA(result,
+        HANDLE h = CreateFileW(ResultBufBgn,
             FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             0,
             OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
@@ -155,13 +190,71 @@ char *realpath(const char *path, char *resolved)
         errno = maperror(err);
         result = 0;
     }
-
     return result;
+}
+
+static int uncpath(const char *path, WCHAR *buf, int nchar)
+{
+    PWSTR BufP = 0;
+    if ('\\' == path[0] && '\\' == path[1])
+    {
+        if (8 < nchar &&
+            0 < MultiByteToWideChar(CP_UTF8, 0, &path[2], -1, &buf[8], nchar - 8))
+        {
+            BufP = &buf[8];
+            buf[0] = L'\\';
+            buf[1] = L'\\';
+            buf[2] = L'?';
+            buf[3] = L'\\';
+            buf[4] = L'U';
+            buf[5] = L'N';
+            buf[6] = L'C';
+            buf[7] = L'\\';
+        }
+    }
+    else
+    {
+        if (4 < nchar &&
+            0 < MultiByteToWideChar(CP_UTF8, 0, path, -1, &buf[4], nchar - 4))
+        {
+            BufP = &buf[4];
+            buf[0] = L'\\';
+            buf[1] = L'\\';
+            buf[2] = L'?';
+            buf[3] = L'\\';
+        }
+    }
+
+    if (0 == BufP)
+    {
+        if (0 < nchar)
+            buf[0] = 0;
+        return 0;
+    }
+
+    PWSTR P = BufP;
+    while (*BufP)
+    {
+        if (L'/' == *BufP || L'\\' == *BufP)
+        {
+            while (L'/' == BufP[1] || L'\\' == BufP[1])
+                BufP++;
+        }
+        if (L'/' == *BufP)
+            *P = L'\\';
+        else if (P != BufP)
+            *P = *BufP;
+        BufP++;
+        P++;
+    }
+    if (P != BufP)
+        *P = 0;
+    return 1;
 }
 
 int statvfs(const char *path, struct fuse_statvfs *stbuf)
 {
-    char root[PATH_MAX];
+    WCHAR root[PATH_MAX];
     DWORD
         VolumeSerialNumber,
         MaxComponentLength,
@@ -170,9 +263,11 @@ int statvfs(const char *path, struct fuse_statvfs *stbuf)
         NumberOfFreeClusters,
         TotalNumberOfClusters;
 
-    if (!GetVolumePathNameA(path, root, PATH_MAX) ||
-        !GetVolumeInformationA(root, 0, 0, &VolumeSerialNumber, &MaxComponentLength, 0, 0, 0) ||
-        !GetDiskFreeSpaceA(root, &SectorsPerCluster, &BytesPerSector,
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    if (!GetVolumePathNameW(PathBuf, root, PATH_MAX) ||
+        !GetVolumeInformationW(root, 0, 0, &VolumeSerialNumber, &MaxComponentLength, 0, 0, 0) ||
+        !GetDiskFreeSpaceW(root, &SectorsPerCluster, &BytesPerSector,
             &NumberOfFreeClusters, &TotalNumberOfClusters))
     {
         return error();
@@ -201,7 +296,9 @@ int open(const char *path, int oflag, ...)
         CREATE_NEW :
         cd[(oflag & (_O_CREAT | _O_TRUNC)) >> 8];
 
-    HANDLE h = CreateFileA(path,
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    HANDLE h = CreateFileW(PathBuf,
         DesiredAccess, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         0/* default security */,
         CreationDisposition, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, 0);
@@ -305,7 +402,9 @@ int close(int fd)
 
 int lstat(const char *path, struct fuse_stat *stbuf)
 {
-    HANDLE h = CreateFileA(path,
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    HANDLE h = CreateFileW(PathBuf,
         FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         0,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
@@ -339,7 +438,9 @@ int lchflags(const char *path, uint32_t flags)
     if (0 == FileAttributes)
         FileAttributes = FILE_ATTRIBUTE_NORMAL;
 
-    if (!SetFileAttributesA(path, FileAttributes))
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    if (!SetFileAttributesW(PathBuf, FileAttributes))
         return error();
 #endif
 
@@ -348,7 +449,9 @@ int lchflags(const char *path, uint32_t flags)
 
 int truncate(const char *path, fuse_off_t size)
 {
-    HANDLE h = CreateFileA(path,
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    HANDLE h = CreateFileW(PathBuf,
         FILE_WRITE_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         0,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
@@ -382,7 +485,9 @@ int utimensat(int dirfd, const char *path, const struct fuse_timespec times[2], 
     /* ignore dirfd and assume that it is always AT_FDCWD */
     /* ignore flag and assume that it is always AT_SYMLINK_NOFOLLOW */
 
-    HANDLE h = CreateFileA(path,
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    HANDLE h = CreateFileW(PathBuf,
         FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         0,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
@@ -412,7 +517,9 @@ int utimensat(int dirfd, const char *path, const struct fuse_timespec times[2], 
 
 int setcrtime(const char *path, const struct fuse_timespec *tv)
 {
-    HANDLE h = CreateFileA(path,
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    HANDLE h = CreateFileW(PathBuf,
         FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         0,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
@@ -432,7 +539,9 @@ int setcrtime(const char *path, const struct fuse_timespec *tv)
 
 int unlink(const char *path)
 {
-    if (!DeleteFileA(path))
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    if (!DeleteFileW(PathBuf))
         return error();
 
     return 0;
@@ -440,7 +549,11 @@ int unlink(const char *path)
 
 int rename(const char *oldpath, const char *newpath)
 {
-    if (!MoveFileExA(oldpath, newpath, MOVEFILE_REPLACE_EXISTING))
+    WCHAR OldPathBuf[PATH_MAX];
+    WCHAR NewPathBuf[PATH_MAX];
+    uncpath(oldpath, OldPathBuf, PATH_MAX);
+    uncpath(newpath, NewPathBuf, PATH_MAX);
+    if (!MoveFileExW(OldPathBuf, NewPathBuf, MOVEFILE_REPLACE_EXISTING))
         return error();
 
     return 0;
@@ -448,7 +561,9 @@ int rename(const char *oldpath, const char *newpath)
 
 static int lsetea(const char *path, PFILE_FULL_EA_INFORMATION Ea, ULONG EaLength)
 {
-    HANDLE h = CreateFileA(path,
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    HANDLE h = CreateFileW(PathBuf,
         FILE_WRITE_EA | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         0,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
@@ -483,7 +598,9 @@ static int lgetea(const char *path,
     PFILE_GET_EA_INFORMATION GetEa, ULONG GetEaLength,
     PFILE_FULL_EA_INFORMATION Ea, ULONG EaLength)
 {
-    HANDLE h = CreateFileA(path,
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    HANDLE h = CreateFileW(PathBuf,
         FILE_READ_EA | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         0,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
@@ -675,7 +792,9 @@ int lremovexattr(const char *path, const char *name)
 
 int mkdir(const char *path, fuse_mode_t mode)
 {
-    if (!CreateDirectoryA(path, 0/* default security */))
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    if (!CreateDirectoryW(PathBuf, 0/* default security */))
         return error();
 
     return 0;
@@ -683,7 +802,9 @@ int mkdir(const char *path, fuse_mode_t mode)
 
 int rmdir(const char *path)
 {
-    if (!RemoveDirectoryA(path))
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    if (!RemoveDirectoryW(PathBuf))
         return error();
 
     return 0;
@@ -691,7 +812,9 @@ int rmdir(const char *path)
 
 DIR *opendir(const char *path)
 {
-    HANDLE h = CreateFileA(path,
+    WCHAR PathBuf[PATH_MAX];
+    uncpath(path, PathBuf, PATH_MAX);
+    HANDLE h = CreateFileW(PathBuf,
         FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         0,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
@@ -736,18 +859,20 @@ void rewinddir(DIR *dirp)
 
 struct dirent *readdir(DIR *dirp)
 {
-    WIN32_FIND_DATAA FindData;
+    WIN32_FIND_DATAW FindData;
     struct fuse_stat *stbuf = &dirp->de.d_stat;
 
     if (INVALID_HANDLE_VALUE == dirp->fh)
     {
-        dirp->fh = FindFirstFileA(dirp->path, &FindData);
+        WCHAR PathBuf[PATH_MAX];
+        uncpath(dirp->path, PathBuf, PATH_MAX);
+        dirp->fh = FindFirstFileW(PathBuf, &FindData);
         if (INVALID_HANDLE_VALUE == dirp->fh)
             return error0();
     }
     else
     {
-        if (!FindNextFileA(dirp->fh, &FindData))
+        if (!FindNextFileW(dirp->fh, &FindData))
         {
             if (ERROR_NO_MORE_FILES == GetLastError())
                 return 0;
@@ -768,7 +893,7 @@ struct dirent *readdir(DIR *dirp)
     stbuf->st_flags = MapFileAttributesToFlags(FindData.dwFileAttributes);
 #endif
 
-    strcpy(dirp->de.d_name, FindData.cFileName);
+    WideCharToMultiByte(CP_UTF8, 0, FindData.cFileName, -1, dirp->de.d_name, 255 * 4, 0, 0);
 
     return &dirp->de;
 }

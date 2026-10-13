@@ -1,7 +1,7 @@
 /**
  * @file sys/fsctl.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -81,6 +81,10 @@ static NTSTATUS FspFsctlFileSystemControl(
             if (0 != IrpSp->FileObject->FsContext2)
                 Result = FspVolumeMakeMountdev(FsctlDeviceObject, Irp, IrpSp);
             break;
+        case FSP_FSCTL_MOUNTMGR:
+            if (0 != IrpSp->FileObject->FsContext2)
+                Result = FspVolumeUseMountmgr(FsctlDeviceObject, Irp, IrpSp);
+            break;
         case FSP_FSCTL_VOLUME_NAME:
             if (0 != IrpSp->FileObject->FsContext2)
                 Result = FspVolumeGetName(FsctlDeviceObject, Irp, IrpSp);
@@ -123,6 +127,9 @@ static NTSTATUS FspFsctlFileSystemControl(
         case FSP_FSCTL_NOTIFY:
             if (0 != IrpSp->FileObject->FsContext2)
                 Result = FspVolumeNotify(FsctlDeviceObject, Irp, IrpSp);
+            break;
+        case FSP_FSCTL_UNLOAD:
+            Result = FspDriverUnload(FsctlDeviceObject, Irp, IrpSp);
             break;
         default:
             if (CTL_CODE(0, 0xC00, 0, 0) ==
@@ -434,9 +441,6 @@ static NTSTATUS FspFsvolFileSystemControlOplock(
     ULONG OplockCount;
     FSP_FSVOL_FILESYSTEM_CONTROL_OPLOCK_COMPLETION_CONTEXT *CompletionContext;
 
-    if (FileNode->IsDirectory)
-        return STATUS_INVALID_PARAMETER;
-
     /*
      * As per FastFat:
      *
@@ -503,8 +507,7 @@ static NTSTATUS FspFsvolFileSystemControlOplock(
     {
         BOOLEAN DeletePending;
 
-        DeletePending = 0 != FileNode->DeletePending;
-        MemoryBarrier();
+        DeletePending = FspFileNodeDeletePending(FileNode);
         if (DeletePending)
         {
             Result = STATUS_DELETE_PENDING;
@@ -725,6 +728,7 @@ static NTSTATUS FspFsvolFileSystemControl(
             Result = FspVolumeWork(FsvolDeviceObject, Irp, IrpSp);
             break;
         case FSP_FSCTL_QUERY_WINFSP:
+        case FSCTL_IS_VOLUME_MOUNTED:
             Irp->IoStatus.Information = 0;
             Result = STATUS_SUCCESS;
             break;

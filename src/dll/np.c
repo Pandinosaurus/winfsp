@@ -1,7 +1,7 @@
 /**
  * @file dll/np.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -454,6 +454,41 @@ exit:
     return NpResult;
 }
 
+static BOOLEAN FspNpCheckRemoteVolume(PWSTR RemoteName)
+{
+    PWSTR ClassName, InstanceName, P;
+    ULONG ClassNameLen, InstanceNameLen;
+    WCHAR RemoteNameBuf[9 + sizeof(((FSP_FSCTL_VOLUME_PARAMS *)0)->Prefix) / sizeof(WCHAR)];
+    HANDLE Handle;
+    DWORD Bytes;
+    BOOLEAN Result;
+
+    if (!FspNpParseRemoteName(RemoteName,
+        &ClassName, &ClassNameLen, &InstanceName, &InstanceNameLen))
+        return FALSE;
+
+    Result = FALSE;
+
+    P = RemoteNameBuf;
+    *P++ = L'\\'; *P++ = L'\\'; *P++ = L'?'; *P++ = L'\\';
+    *P++ = L'U'; *P++ = L'N'; *P++ = L'C'; *P++ = L'\\';
+    memcpy(P, ClassName, ClassNameLen * sizeof(WCHAR)); P += ClassNameLen; *P++ = L'\\';
+    memcpy(P, InstanceName, InstanceNameLen * sizeof(WCHAR)); P += InstanceNameLen; *P++ = L'\\';
+    *P++ = L'\0';
+
+    Handle = CreateFileW(RemoteNameBuf,
+        FILE_READ_ATTRIBUTES, 0, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
+    if (INVALID_HANDLE_VALUE != Handle)
+    {
+        /* the file system is up and running; is it WinFsp? */
+        if (DeviceIoControl(Handle, FSP_FSCTL_QUERY_WINFSP, 0, 0, 0, 0, &Bytes, 0))
+            Result = TRUE;
+        CloseHandle(Handle);
+    }
+
+    return Result;
+}
+
 DWORD APIENTRY NPGetConnection(
     LPWSTR lpLocalName, LPWSTR lpRemoteName, LPDWORD lpnBufferLen)
 {
@@ -573,7 +608,16 @@ DWORD APIENTRY NPAddConnection(LPNETRESOURCEW lpNetResource, LPWSTR lpPassword, 
 
     NpResult = FspNpGetRemoteInfo(lpRemoteName, 0, &CredentialsKind, &AllowImpersonation);
     if (WN_SUCCESS != NpResult)
+    {
+        /*
+         * This may still be a WinFsp network file system, but not managed by the Launcher.
+         * So if it is already live, one of ours and we do not need to map a drive, then go
+         * ahead and report success.
+         */
+        if (L'\0' == LocalNameBuf[0] && FspNpCheckRemoteVolume(lpRemoteName))
+            NpResult = WN_SUCCESS;
         return NpResult;
+    }
 
 #if defined(FSP_NP_CREDENTIAL_MANAGER)
     /* if we need credentials and none were passed check with the credential manager */
@@ -720,6 +764,15 @@ DWORD APIENTRY NPAddConnection(LPNETRESOURCEW lpNetResource, LPWSTR lpPassword, 
             /* we are not being asked for a drive mapping, so whatever we have is good! */
             NpResult = WN_SUCCESS;
         break;
+    case WN_NO_NETWORK:
+        /*
+         * This may still be a WinFsp network file system, but not managed by the Launcher.
+         * So if it is already live, one of ours and we do not need to map a drive, then go
+         * ahead and report success.
+         */
+        if (L'\0' == LocalNameBuf[0] && FspNpCheckRemoteVolume(lpRemoteName))
+            NpResult = WN_SUCCESS;
+        break;
     default:
         NpResult = WN_NO_NETWORK;
         break;
@@ -860,6 +913,99 @@ DWORD APIENTRY NPCancelConnection(LPWSTR lpName, BOOL fForce)
         break;
     }
 
+    return NpResult;
+}
+
+DWORD APIENTRY NPGetUniversalName(
+    LPCWSTR lpLocalPath,
+    DWORD dwInfoLevel,
+    LPVOID lpBuffer,
+    LPDWORD lpBufferSize)
+{
+    DWORD NpResult;
+    WCHAR LocalNameBuf[3];
+    PCWSTR RemainLocalPath;
+    WCHAR RemoteNameBuf[sizeof(((FSP_FSCTL_VOLUME_PARAMS *)0)->Prefix) / sizeof(WCHAR)];
+    DWORD RemoteNameSize, RemainLocalPathSize, RequiredBufferSize;
+
+    if (UNIVERSAL_NAME_INFO_LEVEL != dwInfoLevel &&
+        REMOTE_NAME_INFO_LEVEL != dwInfoLevel)
+        return WN_BAD_LEVEL;
+
+    if (0 == lpLocalPath ||
+        L'\0' == lpLocalPath[0] ||
+        L':' != lpLocalPath[1] ||
+        (L'\0' != lpLocalPath[2] && L'\\' != lpLocalPath[2]))
+        return WN_BAD_LOCALNAME;
+
+    LocalNameBuf[0] = lpLocalPath[0];
+    LocalNameBuf[1] = L':';
+    LocalNameBuf[2] = L'\0';
+    RemainLocalPath = lpLocalPath + 2;
+
+    RemoteNameSize = sizeof RemoteNameBuf / sizeof(WCHAR);
+    NpResult = NPGetConnection(LocalNameBuf, RemoteNameBuf, &RemoteNameSize);
+    if (WN_SUCCESS != NpResult)
+        return NpResult;
+
+    RemoteNameSize = lstrlenW(RemoteNameBuf) * sizeof(WCHAR);
+    RemainLocalPathSize = lstrlenW(RemainLocalPath) * sizeof(WCHAR) + sizeof(WCHAR)/* term-0 */;
+
+    if (UNIVERSAL_NAME_INFO_LEVEL == dwInfoLevel)
+    {
+        RequiredBufferSize = sizeof(UNIVERSAL_NAME_INFOW) +
+            /* UniversalName */ RemoteNameSize + RemainLocalPathSize;
+
+        if (RequiredBufferSize > *lpBufferSize)
+        {
+            *lpBufferSize = RequiredBufferSize;
+            NpResult = WN_MORE_DATA;
+            goto exit;
+        }
+
+        LPUNIVERSAL_NAME_INFOW Info = lpBuffer;
+        memset(Info, 0, sizeof *Info);
+        Info->lpUniversalName = (PVOID)(Info + 1);
+        memcpy(Info->lpUniversalName, RemoteNameBuf, RemoteNameSize);
+        memcpy((PUINT8)Info->lpUniversalName + RemoteNameSize, RemainLocalPath,
+            RemainLocalPathSize);
+
+        NpResult = WN_SUCCESS;
+    }
+    else if (REMOTE_NAME_INFO_LEVEL == dwInfoLevel)
+    {
+        RequiredBufferSize = sizeof(REMOTE_NAME_INFOW) +
+            /* UniversalName */ RemoteNameSize + RemainLocalPathSize +
+            /* ConnectionName */RemoteNameSize + sizeof(WCHAR) +
+            /* RemainingPath */ RemainLocalPathSize;
+
+        if (RequiredBufferSize > *lpBufferSize)
+        {
+            *lpBufferSize = RequiredBufferSize;
+            NpResult = WN_MORE_DATA;
+            goto exit;
+        }
+
+        LPREMOTE_NAME_INFOW Info = lpBuffer;
+        memset(Info, 0, sizeof *Info);
+        Info->lpUniversalName = (PVOID)(Info + 1);
+        Info->lpConnectionName = (PVOID)((PUINT8)Info->lpUniversalName +
+            RemoteNameSize + RemainLocalPathSize);
+        Info->lpRemainingPath = (PVOID)((PUINT8)Info->lpConnectionName +
+            RemoteNameSize + sizeof(WCHAR));
+        memcpy(Info->lpUniversalName, RemoteNameBuf, RemoteNameSize);
+        memcpy((PUINT8)Info->lpUniversalName + RemoteNameSize, RemainLocalPath,
+            RemainLocalPathSize);
+        memcpy(Info->lpConnectionName, RemoteNameBuf, RemoteNameSize + sizeof(WCHAR));
+        memcpy(Info->lpRemainingPath, RemainLocalPath, RemainLocalPathSize);
+
+        NpResult = WN_SUCCESS;
+    }
+    else
+        /* should not happen! */
+        NpResult = WN_BAD_LEVEL;
+
+exit:
     return NpResult;
 }
 
@@ -1059,15 +1205,34 @@ DWORD APIENTRY NPCloseEnum(HANDLE hEnum)
 NTSTATUS FspNpRegister(VOID)
 {
     extern HINSTANCE DllInstance;
-    WCHAR ProviderPath[MAX_PATH];
+    WCHAR DllPath[MAX_PATH], ProviderPath[MAX_PATH];
+    PWSTR VersionInfoPath;
+    BOOLEAN HasPercent;
     WCHAR RegBuffer[1024];
     PWSTR P, Part;
     DWORD RegResult, RegType, RegBufferSize, RegBufferOffset;
     HKEY RegKey;
     BOOLEAN FoundProvider;
+    NTSTATUS Result;
 
-    if (0 == GetModuleFileNameW(DllInstance, ProviderPath, MAX_PATH))
-        return FspNtStatusFromWin32(GetLastError());
+    VersionInfoPath = ProviderPath;
+    HasPercent = FALSE;
+    for (P = L"" MyNpRegisterPath; *P; P++)
+        if ('%' == *P)
+        {
+            HasPercent = TRUE;
+            break;
+        }
+    if (HasPercent)
+    {
+        VersionInfoPath = DllPath;
+        if (0 == GetModuleFileNameW(DllInstance, DllPath, MAX_PATH))
+            return FspNtStatusFromWin32(GetLastError());
+    }
+
+    Result = FspGetModuleFileName(DllInstance, ProviderPath, MAX_PATH, L"" MyNpRegisterPath);
+    if (!NT_SUCCESS(Result))
+        return Result;
 
     RegResult = RegCreateKeyExW(
         HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\" FSP_NP_NAME,
@@ -1094,12 +1259,12 @@ NTSTATUS FspNpRegister(VOID)
         DWORD Size;
         PWSTR Description;
 
-        Size = GetFileVersionInfoSizeW(ProviderPath, &Size/*dummy*/);
+        Size = GetFileVersionInfoSizeW(VersionInfoPath, &Size/*dummy*/);
         if (0 < Size)
         {
             VersionInfo = MemAlloc(Size);
             if (0 != VersionInfo &&
-                GetFileVersionInfoW(ProviderPath, 0, Size, VersionInfo) &&
+                GetFileVersionInfoW(VersionInfoPath, 0, Size, VersionInfo) &&
                 VerQueryValueW(VersionInfo, L"\\StringFileInfo\\040904b0\\FileDescription",
                     &Description, &Size))
             {
@@ -1115,7 +1280,8 @@ NTSTATUS FspNpRegister(VOID)
         goto close_and_exit;
 
     RegResult = RegSetValueExW(RegKey,
-        L"ProviderPath", 0, REG_SZ, (PVOID)ProviderPath, (lstrlenW(ProviderPath) + 1) * sizeof(WCHAR));
+        L"ProviderPath", 0, HasPercent ? REG_EXPAND_SZ : REG_SZ,
+        (PVOID)ProviderPath, (lstrlenW(ProviderPath) + 1) * sizeof(WCHAR));
     if (ERROR_SUCCESS != RegResult)
         goto close_and_exit;
 

@@ -4,7 +4,7 @@
  * Shared kernel/user configuration. This file is to be included by the
  * FSD and DLL components ONLY!
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -29,5 +29,11 @@
  * Define the FSP_CFG_REJECT_EARLY_IRP macro to support the RejectIrpPriorToTransact0 flag.
  */
 #define FSP_CFG_REJECT_EARLY_IRP
+
+/*
+ * SxS separator. The '+' in "WinFsp+20220906T173701Z".
+ */
+#define FSP_SXS_SEPARATOR_CHAR			'+'
+#define FSP_SXS_SEPARATOR_STRING		"+"
 
 #endif

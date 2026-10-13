@@ -1,7 +1,7 @@
 /**
  * @file dll/util.c
  *
- * @copyright 2015-2021 Bill Zissimopoulos
+ * @copyright 2015-2026 Bill Zissimopoulos
  */
 /*
  * This file is part of WinFsp.
@@ -21,6 +21,7 @@
 
 #include <dll/library.h>
 #include <aclapi.h>
+#include <shlwapi.h>
 
 static INIT_ONCE FspDiagIdentInitOnce = INIT_ONCE_STATIC_INIT;
 static WCHAR FspDiagIdentBuf[20] = L"UNKNOWN";
@@ -61,6 +62,150 @@ PWSTR FspDiagIdent(VOID)
 
     InitOnceExecuteOnce(&FspDiagIdentInitOnce, FspDiagIdentInitialize, 0, 0);
     return FspDiagIdentBuf;
+}
+
+static INIT_ONCE FspCreateDirectoryFileInitOnce = INIT_ONCE_STATIC_INIT;
+static NTSTATUS (NTAPI *FspNtCreateFile)(
+    PHANDLE FileHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize,
+    ULONG FileAttributes,
+    ULONG ShareAccess,
+    ULONG CreateDisposition,
+    ULONG CreateOptions,
+    PVOID EaBuffer,
+    ULONG EaLength);
+
+static BOOL WINAPI FspCreateDirectoryFileInitialize(
+    PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context)
+{
+    HANDLE Handle;
+
+    Handle = GetModuleHandleW(L"ntdll.dll");
+    if (0 != Handle)
+        FspNtCreateFile = (PVOID)GetProcAddress(Handle, "NtCreateFile");
+
+    return TRUE;
+}
+
+HANDLE FspCreateDirectoryFileW(
+    PWSTR FileName,
+    DWORD DesiredAccess,
+    DWORD ShareAccess,
+    PSECURITY_ATTRIBUTES SecurityAttributes,
+    DWORD FlagsAndAttributes)
+{
+    InitOnceExecuteOnce(&FspCreateDirectoryFileInitOnce, FspCreateDirectoryFileInitialize, 0, 0);
+    if (0 == FspNtCreateFile)
+    {
+        SetLastError(ERROR_INVALID_FUNCTION);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE Handle = INVALID_HANDLE_VALUE, ParentHandle = INVALID_HANDLE_VALUE;
+    PWSTR FullFileName = 0;
+    WCHAR *FilePart, FilePartChar;
+    DWORD Length;
+    UNICODE_STRING UFullFileName;
+    OBJECT_ATTRIBUTES Obja;
+    ULONG CreateFlags;
+    IO_STATUS_BLOCK IoStatus;
+
+    Length = GetFullPathNameW(FileName, 0, 0, 0);
+    if (0 == Length)
+        goto exit;
+
+    FullFileName = MemAlloc((Length + 1) * sizeof(WCHAR));
+    if (0 == FullFileName)
+    {
+        SetLastError(ERROR_NO_SYSTEM_RESOURCES);
+        goto exit;
+    }
+
+    Length = GetFullPathNameW(FileName, Length + 1, FullFileName, &FilePart);
+    if (0 == Length)
+        goto exit;
+    if (0 == FilePart)
+    {
+        SetLastError(ERROR_INVALID_NAME);
+        goto exit;
+    }
+
+    FilePartChar = *FilePart;
+    *FilePart = L'\0';
+
+    ParentHandle = CreateFileW(
+        FullFileName,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        0,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        0);
+    if (INVALID_HANDLE_VALUE == ParentHandle)
+        goto exit;
+
+    *FilePart = FilePartChar;
+
+    UFullFileName.Length = UFullFileName.MaximumLength = (USHORT)(lstrlenW(FilePart) * sizeof(WCHAR));
+    UFullFileName.Buffer = FilePart;
+
+    memset(&Obja, 0, sizeof Obja);
+    Obja.Length = sizeof Obja;
+    Obja.ObjectName = &UFullFileName;
+    Obja.Attributes =
+        (!(FlagsAndAttributes & FILE_FLAG_POSIX_SEMANTICS) ? OBJ_CASE_INSENSITIVE : 0) |
+        (SecurityAttributes->bInheritHandle ? OBJ_INHERIT : 0);
+    Obja.RootDirectory = ParentHandle;
+    Obja.SecurityDescriptor = SecurityAttributes->lpSecurityDescriptor;
+
+    DesiredAccess |=
+        SYNCHRONIZE |
+        FILE_READ_ATTRIBUTES |
+        ((FlagsAndAttributes & FILE_FLAG_DELETE_ON_CLOSE) ? DELETE : 0);
+
+    CreateFlags =
+        FILE_DIRECTORY_FILE |
+        ((FlagsAndAttributes & FILE_FLAG_WRITE_THROUGH) ? FILE_WRITE_THROUGH : 0) |
+        ((FlagsAndAttributes & FILE_FLAG_OVERLAPPED) ? FILE_SYNCHRONOUS_IO_NONALERT : 0) |
+        ((FlagsAndAttributes & FILE_FLAG_NO_BUFFERING) ? FILE_NO_INTERMEDIATE_BUFFERING : 0) |
+        ((FlagsAndAttributes & FILE_FLAG_RANDOM_ACCESS) ? FILE_RANDOM_ACCESS : 0) |
+        ((FlagsAndAttributes & FILE_FLAG_SEQUENTIAL_SCAN) ? FILE_SEQUENTIAL_ONLY : 0) |
+        ((FlagsAndAttributes & FILE_FLAG_DELETE_ON_CLOSE) ? FILE_DELETE_ON_CLOSE : 0) |
+        ((FlagsAndAttributes & FILE_FLAG_BACKUP_SEMANTICS) ? FILE_OPEN_FOR_BACKUP_INTENT : 0) |
+        ((FlagsAndAttributes & FILE_FLAG_OPEN_REPARSE_POINT) ? FILE_OPEN_REPARSE_POINT : 0) |
+        ((FlagsAndAttributes & FILE_FLAG_OPEN_NO_RECALL) ? FILE_OPEN_NO_RECALL : 0);
+
+    IoStatus.Status = FspNtCreateFile(
+        &Handle,
+        DesiredAccess,
+        &Obja,
+        &IoStatus,
+        0,
+        FlagsAndAttributes & (0x7fff & ~FILE_ATTRIBUTE_DIRECTORY),
+        ShareAccess,
+        FILE_CREATE,
+        CreateFlags,
+        0,
+        0);
+    if (!NT_SUCCESS(IoStatus.Status))
+    {
+        SetLastError(FspWin32FromNtStatus(IoStatus.Status));
+        Handle = INVALID_HANDLE_VALUE;
+        goto exit;
+    }
+
+    SetLastError(0);
+
+exit:
+    if (INVALID_HANDLE_VALUE != ParentHandle)
+        CloseHandle(ParentHandle);
+
+    MemFree(FullFileName);
+
+    return Handle;
 }
 
 FSP_API NTSTATUS FspCallNamedPipeSecurely(PWSTR PipeName,
@@ -214,4 +359,138 @@ FSP_API NTSTATUS FspVersion(PUINT32 PVersion)
     *PVersion = Version;
 
     return STATUS_SUCCESS;
+}
+
+NTSTATUS FspGetModuleVersion(PWSTR ModuleFileName, PUINT32 PVersion)
+{
+    /* internal only: get version of any module */
+
+    PVOID VersionInfo;
+    DWORD Size;
+    VS_FIXEDFILEINFO *FixedFileInfo = 0;
+    UINT32 Version;
+
+    *PVersion = 0;
+
+    Size = GetFileVersionInfoSizeW(ModuleFileName, &Size/*dummy*/);
+    if (0 < Size)
+    {
+        VersionInfo = MemAlloc(Size);
+        if (0 != VersionInfo &&
+            GetFileVersionInfoW(ModuleFileName, 0, Size, VersionInfo) &&
+            VerQueryValueW(VersionInfo, L"\\", &FixedFileInfo, &Size))
+        {
+            Version = FixedFileInfo->dwFileVersionMS;
+        }
+
+        MemFree(VersionInfo);
+    }
+
+    if (0 == FixedFileInfo)
+        return STATUS_UNSUCCESSFUL;
+
+    *PVersion = Version;
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS FspGetModuleFileName(
+    HMODULE Module,
+    PWSTR FileName,
+    ULONG Size,
+    PWSTR RelativePath)
+{
+    if (MAX_PATH > Size)
+        return STATUS_BUFFER_TOO_SMALL;
+
+    if (0 != RelativePath &&
+        L'\0' != RelativePath[0] &&
+        (L'.' != RelativePath[0] || L'\0' != RelativePath[1]))
+    {
+        WCHAR Temp[MAX_PATH];
+
+        if (0 == GetModuleFileNameW(Module, Temp, MAX_PATH))
+            return FspNtStatusFromWin32(GetLastError());
+
+        if (0 == PathCombineW(FileName, Temp, RelativePath))
+            return STATUS_UNSUCCESSFUL;
+    }
+    else
+    {
+        if (0 == GetModuleFileNameW(Module, FileName, MAX_PATH))
+            return FspNtStatusFromWin32(GetLastError());
+    }
+
+    return STATUS_SUCCESS;
+}
+
+VOID FspAdaptiveLockAcquire(
+    FSP_ADAPTIVE_LOCK *Lock,
+    PWSTR FileName,
+    UINT64 Offset,
+    DWORD Timeout)
+{
+    AcquireSRWLockExclusive(&Lock->Lock);
+
+    if (0 != FileName)
+    {
+        HANDLE Handle;
+        DWORD BytesTransferred;
+        OVERLAPPED Overlapped;
+        BOOL Success;
+
+        Handle = CreateFileW(
+            FileName,
+            FILE_READ_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED,
+            0);
+        if (INVALID_HANDLE_VALUE != Handle)
+        {
+            memset(&Overlapped, 0, sizeof Overlapped);
+            Overlapped.Offset = ((PLARGE_INTEGER)&Offset)->LowPart;
+            Overlapped.OffsetHigh = ((PLARGE_INTEGER)&Offset)->HighPart;
+
+            Success = LockFileEx(
+                Handle,
+                LOCKFILE_EXCLUSIVE_LOCK, 0,
+                1, 0,
+                &Overlapped);
+            if (Success || ERROR_IO_PENDING == GetLastError())
+            {
+                Success = FALSE;
+                if (WAIT_OBJECT_0 == WaitForSingleObject(Handle, Timeout))
+                    Success = GetOverlappedResult(Handle, &Overlapped, &BytesTransferred, TRUE);
+            }
+
+            if (Success)
+            {
+                Lock->Handle = Handle;
+                Lock->Offset = Offset;
+            }
+            else
+                CloseHandle(Handle);
+        }
+    }
+}
+
+VOID FspAdaptiveLockRelease(
+    FSP_ADAPTIVE_LOCK *Lock)
+{
+    if (INVALID_HANDLE_VALUE != Lock->Handle)
+    {
+        HANDLE Handle = Lock->Handle;
+        LARGE_INTEGER LargeOffset = *(PLARGE_INTEGER)&Lock->Offset;
+
+        UnlockFile(Handle, LargeOffset.LowPart, LargeOffset.HighPart, 1, 0);
+
+        CloseHandle(Handle);
+
+        Lock->Handle = INVALID_HANDLE_VALUE;
+        Lock->Offset = 0;
+    }
+
+    ReleaseSRWLockExclusive(&Lock->Lock);
 }
